@@ -1,0 +1,19 @@
+# Reference deployment of the Dockge web app. `dockge.install` runs
+# `docker compose up -d` against this file (or a copy of it).
+#
+# Dockge needs the host Docker socket (it shells out to `docker compose` to
+# manage stacks) and the SAME absolute path for its stacks directory on both
+# the host and inside the container — see DOCKGE_STACKS_DIR.
+services:
+  dockge:
+    image: louislam/dockge:1
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      # The stacks dir must be identical on host + container.
+      - /opt/stacks:/opt/stacks
+    environment:
+      - DOCKGE_STACKS_DIR=/opt/stacks
