@@ -2,7 +2,7 @@
 
 [Dockge](https://github.com/louislam/dockge) is a fancy, self-hosted Docker
 Compose stack manager — a web UI for bringing `compose.yml` stacks up, down, and
-restarting them. This repo is a first-class [orca](https://github.com/scottdkey/orca)
+restarting them. This repo is a first-class [orca](https://github.com/argyle-labs/orca)
 plugin that owns the full lifecycle (install, update, backup/restore) plus a
 tool surface for managing the stacks Dockge controls — and a curl-bootstrappable
 Docker Compose deploy.
