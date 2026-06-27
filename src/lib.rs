@@ -69,12 +69,7 @@ impl From<HttpError> for DockgeError {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    plugin_toolkit::serde::Serialize,
-    plugin_toolkit::serde::Deserialize,
-)]
+#[derive(Debug, Clone, plugin_toolkit::serde::Serialize, plugin_toolkit::serde::Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct ActionResult {
     pub stack: String,
