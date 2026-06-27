@@ -55,6 +55,26 @@ Update / back up:
 
 ---
 
+## Podman
+
+The same [`compose.yml`](compose.yml) runs under Podman, but note Dockge shells
+out to `docker compose` to manage stacks and mounts the Docker socket. To run
+Dockge itself under Podman, map the Podman socket
+(`/run/podman/podman.sock:/var/run/docker.sock`) and provide a `docker`-compatible
+CLI; otherwise keep Dockge on Docker and use Podman only for other services.
+
+```sh
+podman compose -f compose.yml up -d
+```
+
+## Proxmox LXC
+
+There are no native-LXC assets for Dockge — it ships as the upstream image. On
+Proxmox, create a Debian/Ubuntu LXC, install Docker (Dockge manages Docker
+Compose stacks, so Docker is the natural fit), and use the Docker / Compose path
+above (Docker-in-LXC). The `/opt/stacks` path must be identical inside and
+outside the container.
+
 ## orca plugin
 
 ### Tool surface
