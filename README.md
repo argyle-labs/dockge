@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="dockge" />
+</p>
+
 # dockge
 
 [Dockge](https://github.com/louislam/dockge) is a fancy, self-hosted Docker
