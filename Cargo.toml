@@ -2,6 +2,10 @@
 name = "dockge"
 version = "0.1.0"
 edition = "2021"
+description = "Dockge self-hosted Compose stack manager — orca plugin + deploy assets"
+
+[package.metadata.orca]
+category = "infra"
 
 [lib]
 name = "dockge"
