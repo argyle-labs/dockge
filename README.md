@@ -14,11 +14,17 @@ This repo **ships a `compose.yml`** — run dockge **by hand, without orca** str
 
 ## Run it without orca
 
+### Docker Compose
+
 ```sh
 docker compose up -d
 ```
 
-See [`compose.yml`](compose.yml) for the image, ports, volumes, and hardware/device mappings and `scripts/` for provisioning helpers. Upstream docs: <https://github.com/louislam/dockge>.
+See [`compose.yml`](compose.yml) for the image, ports, volumes, and hardware/device mappings and `scripts/` for provisioning helpers.
+
+### Other runtimes
+
+**Podman**: `podman compose -f compose.yml up -d`. **LXC / VM**: run the same image via Docker/Podman on the guest, or install upstream. **Unraid**: *Docker → Add Container* with the image/ports/volumes from `compose.yml`. Upstream: <https://github.com/louislam/dockge>.
 
 
 ### Backup & restore
