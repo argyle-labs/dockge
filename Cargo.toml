@@ -1,7 +1,7 @@
 [package]
 name = "dockge"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Dockge self-hosted Compose stack manager — orca plugin + deploy assets"
 
 [package.metadata.orca]
@@ -15,9 +15,10 @@ path = "src/lib.rs"
 # as a normal Rust lib.
 crate-type = ["cdylib", "rlib"]
 
-# Dockge stack-manager plugin. Hand-written HTTP client + `endpoint_resource!`
-# CRUD registry + stack-op tools. No codegen step — there is no upstream
-# OpenAPI spec for Dockge, so the small HTTP surface is hand-rolled.
+# Dockge stack-manager plugin. Socket.IO client (dockge has NO REST — it is
+# Socket.IO v4, user/pass → JWT-in-ack) + `endpoint_resource!` CRUD registry for
+# the dockge *instances* + a `unit` domain backend surfacing compose stacks. No
+# bespoke stack verbs; stacks ride the generic five-verb surface.
 
 [dependencies]
 # The SOLE orca dependency. Every external crate the plugin needs — serde,
@@ -32,7 +33,7 @@ crate-type = ["cdylib", "rlib"]
 # `plugin_toolkit::urlencoding` re-export + endpoint_resource! macro). Until a
 # checkout of orca exists at ../orca, the committed `[patch]` in
 # `.cargo/config.toml` resolves this to the local in-tree toolkit.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", features = ["socketio"] }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
 # `::abi_stable` paths in this crate's root (the cdylib FFI boundary the loader
@@ -42,11 +43,10 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" 
 abi_stable = "0.11"
 
 [dev-dependencies]
-# Dev-only: the in-crate tests reach serde_json + the wiremock HTTP harness.
-# Not runtime deps.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+# Dev-only: the in-crate tests reach serde_json + tokio. The env-gated
+# integration test (`DOCKGE_TEST_URL`) drives a live dockge over Socket.IO.
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", features = ["socketio"] }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
-wiremock = "0.6"
 
 # Match orca's workspace lint floor: discarding a Result/Option via
 # `let _ = ...` was a load-bearing past incident, so keep it a hard error here
