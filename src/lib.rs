@@ -34,6 +34,25 @@ use plugin_toolkit::socketio::{PushHandler, SocketConfig, SocketSession};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Deploying pulls images + starts containers — allow much longer than a
+/// plain ack.
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Dockge routes every stack op through an **agent wrapper**: the client emits
+/// the real event inside an `"agent"` frame — `emit("agent", endpoint, event,
+/// …args)` — and the server pushes back as `["<event>", <data>]`. For a direct
+/// connection the endpoint is empty (dockge treats a falsy endpoint as "this
+/// instance"). Raw events (`requestStackList`, `getStack`, …) are silently
+/// ignored by the server, so they MUST go through this wrapper.
+const AGENT_LOCAL: &str = "";
+
+/// Build the positional args for an agent-wrapped emit: `[endpoint, event,
+/// …extra]`.
+fn agent_args(event: &str, extra: &[Value]) -> Vec<Value> {
+    let mut args = vec![json!(AGENT_LOCAL), json!(event)];
+    args.extend_from_slice(extra);
+    args
+}
 
 /// Connection details for one dockge instance. `password` is supplied by the
 /// caller (loaded from the endpoint row's `#[secret]` field / the secrets
@@ -80,8 +99,9 @@ impl Client {
         Self { cfg }
     }
 
-    /// Connect and authenticate. `stacklist_slot`, if set, captures the pushed
-    /// `stackList` event (dockge streams it on connect + on change).
+    /// Connect and authenticate. `stacklist_slot`, if set, captures dockge's
+    /// pushed `stackList` (streamed on connect + on change) out of the `agent`
+    /// frame it arrives in.
     async fn session(
         &self,
         stacklist_slot: Option<Arc<Mutex<Option<Value>>>>,
@@ -89,10 +109,15 @@ impl Client {
         let mut handlers: Vec<(String, PushHandler)> = Vec::new();
         if let Some(slot) = stacklist_slot {
             handlers.push((
-                "stackList".to_string(),
+                "agent".to_string(),
                 Arc::new(move |v: Value| {
-                    if let Ok(mut g) = slot.lock() {
-                        *g = Some(v);
+                    // Server → client agent frame: `["stackList", { ok,
+                    // stackList, endpoint }]`. Capture the data object.
+                    if let Some(arr) = v.as_array()
+                        && arr.first().and_then(Value::as_str) == Some("stackList")
+                        && let Ok(mut g) = slot.lock()
+                    {
+                        *g = Some(arr.get(1).cloned().unwrap_or(Value::Null));
                     }
                 }) as PushHandler,
             ));
@@ -131,15 +156,19 @@ impl Client {
     pub async fn list_stacks(&self) -> Result<Value> {
         let slot = Arc::new(Mutex::new(None));
         let session = self.session(Some(slot.clone())).await?;
-        // Ask dockge to (re)emit the list; the payload arrives as a push, so
-        // the ack itself is intentionally discarded.
+        // Agent-wrapped request; dockge replies by pushing the `stackList`
+        // agent frame (no ack), which the session handler captures.
         session
-            .emit_ack("requestStackList", json!(null), ACK_TIMEOUT)
+            .emit_args("agent", agent_args("requestStackList", &[]))
             .await
             .ok();
-        let list = wait_for_slot(&slot).await.unwrap_or_else(|| json!({}));
+        let payload = wait_for_slot(&slot).await.unwrap_or_else(|| json!({}));
         session.disconnect().await.ok();
-        Ok(list)
+        // payload = `{ ok, stackList: { name: {…} }, endpoint }`.
+        Ok(payload
+            .get("stackList")
+            .cloned()
+            .unwrap_or_else(|| json!({})))
     }
 
     /// One stack's detail (`{ name, composeYAML, composeENV, status, … }`).
@@ -148,14 +177,16 @@ impl Client {
             bail!("missing stack name");
         }
         let session = self.session(None).await?;
-        let ack = session.emit_ack("getStack", json!(name), ACK_TIMEOUT).await;
+        let ack = session
+            .emit_ack_args("agent", agent_args("getStack", &[json!(name)]), ACK_TIMEOUT)
+            .await;
         session.disconnect().await.ok();
         ack
     }
 
     /// Run a lifecycle action against a stack. `op` ∈
     /// `start` | `stop` | `restart` | `down` | `update` — mapped to dockge's
-    /// `<op>Stack` event (all single-arg).
+    /// agent-wrapped `<op>Stack` event.
     pub async fn stack_action(&self, name: &str, op: &str) -> Result<Value> {
         if name.is_empty() {
             bail!("missing stack name");
@@ -165,7 +196,11 @@ impl Client {
             other => bail!("unknown stack action: {other}"),
         };
         let session = self.session(None).await?;
-        let ack = session.emit_ack(&event, json!(name), ACK_TIMEOUT).await;
+        // Lifecycle actions shell out to `docker compose` (start/stop/pull) and
+        // can take far longer than a plain ack, so allow the deploy timeout.
+        let ack = session
+            .emit_ack_args("agent", agent_args(&event, &[json!(name)]), DEPLOY_TIMEOUT)
+            .await;
         session.disconnect().await.ok();
         ack
     }
@@ -177,7 +212,44 @@ impl Client {
         }
         let session = self.session(None).await?;
         let ack = session
-            .emit_ack("deleteStack", json!(name), ACK_TIMEOUT)
+            .emit_ack_args(
+                "agent",
+                agent_args("deleteStack", &[json!(name)]),
+                ACK_TIMEOUT,
+            )
+            .await;
+        session.disconnect().await.ok();
+        ack
+    }
+
+    /// Create + deploy a stack (dockge `deployStack`: `docker compose up -d`).
+    /// `is_add` = true for a new stack. Deploying pulls images + starts
+    /// containers, so this uses a longer timeout than the ack ops.
+    pub async fn deploy_stack(
+        &self,
+        name: &str,
+        compose_yaml: &str,
+        compose_env: &str,
+        is_add: bool,
+    ) -> Result<Value> {
+        if name.is_empty() {
+            bail!("missing stack name");
+        }
+        let session = self.session(None).await?;
+        let ack = session
+            .emit_ack_args(
+                "agent",
+                agent_args(
+                    "deployStack",
+                    &[
+                        json!(name),
+                        json!(compose_yaml),
+                        json!(compose_env),
+                        json!(is_add),
+                    ],
+                ),
+                DEPLOY_TIMEOUT,
+            )
             .await;
         session.disconnect().await.ok();
         ack
