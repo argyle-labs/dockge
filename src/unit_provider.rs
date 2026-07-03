@@ -89,14 +89,16 @@ impl DockgeUnitProvider {
         let stacks = Self::all_stacks().await?;
         let items = stacks
             .into_iter()
-            .map(|(ep, name, meta)| ItemOutcome {
-                id: Self::unit_id(&ep, &name),
-                payload: serde_json::to_string(&json!({
-                    "endpoint": ep,
-                    "stack": name,
-                    "meta": meta,
-                }))
-                .unwrap_or_default(),
+            .map(|(ep, name, meta)| {
+                ItemOutcome::new(
+                    Self::unit_id(&ep, &name),
+                    serde_json::to_string(&json!({
+                        "endpoint": ep,
+                        "stack": name,
+                        "meta": meta,
+                    }))
+                    .unwrap_or_default(),
+                )
             })
             .collect::<Vec<_>>();
         let total = items.len() as u64;
@@ -110,10 +112,10 @@ impl DockgeUnitProvider {
         let ep = Self::endpoint_of(&args.id.manager).to_string();
         let client = make_client(&ep)?;
         let stack = client.get_stack(&args.id.id).await?;
-        Ok(VerbOutcome::Item(ItemOutcome {
-            id: args.id,
-            payload: serde_json::to_string(&stack).unwrap_or_default(),
-        }))
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            args.id,
+            serde_json::to_string(&stack).unwrap_or_default(),
+        )))
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
