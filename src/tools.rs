@@ -41,8 +41,7 @@ pub struct DockgeEndpoint {
 /// Build a client for a registered endpoint by name. Used by the unit provider
 /// to drive that instance's stacks over Socket.IO.
 pub(crate) fn make_client(name: &str) -> Result<Client> {
-    let conn = runtime::open_db()?;
-    let row = endpoint_db::get(&conn, name)?
+    let row = endpoint_db::get(name)?
         .with_context(|| format!("dockge endpoint '{name}' not registered"))?;
     if !row.enabled {
         bail!("dockge endpoint '{name}' is disabled");
@@ -56,8 +55,7 @@ pub(crate) fn make_client(name: &str) -> Result<Client> {
 
 /// Names of all registered, enabled dockge endpoints.
 pub(crate) fn enabled_endpoints() -> Result<Vec<String>> {
-    let conn = runtime::open_db()?;
-    Ok(endpoint_db::list(&conn)?
+    Ok(endpoint_db::list()?
         .into_iter()
         .filter(|r| r.enabled)
         .map(|r| r.name)
