@@ -41,11 +41,7 @@ pub struct DockgeEndpoint {
 /// Build a client for a registered endpoint by name. Used by the unit provider
 /// to drive that instance's stacks over Socket.IO.
 pub(crate) fn make_client(name: &str) -> Result<Client> {
-    let row = endpoint_db::get(name)?
-        .with_context(|| format!("dockge endpoint '{name}' not registered"))?;
-    if !row.enabled {
-        bail!("dockge endpoint '{name}' is disabled");
-    }
+    let row = endpoint_db::require(name)?;
     Ok(Client::new(Config::new(
         row.base_url,
         row.username,
