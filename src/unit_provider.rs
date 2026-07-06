@@ -8,8 +8,8 @@
 //! - [`Verb::Detail`] → one stack's compose YAML / env / status
 //! - [`Verb::Update`] → action `start` / `stop` / `restart` / `down` / `update`
 //! - [`Verb::Delete`] → remove the stack
-//! - [`Verb::Create`] → deferred: `deployStack` needs multi-arg socket emit
-//!   (toolkit follow-up); single-arg lifecycle ops all work today.
+//! - [`Verb::Create`] → action `deploy`: `deployStack` a new stack (add-only)
+//! - [`Verb::Upsert`] → action `set`: deploy add-if-absent, else update
 //!
 //! Enumeration is resilient: an unreachable or failing endpoint is skipped
 //! (logged), never fatal to the whole list.
@@ -19,14 +19,35 @@ use plugin_toolkit::anyhow::{self, Result};
 use plugin_toolkit::contract::BoxFuture;
 use plugin_toolkit::contract::unit::{
     ActionDecl, ActionOutcome, CreateArgs, DeleteArgs, DetailArgs, ItemOutcome, ItemsOutcome,
-    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, Verb, VerbArgs,
-    VerbDecl, VerbOutcome,
+    KindDeclaration, ListArgs, UnitDescriptor, UnitId, UnitProvider, UpdateArgs, UpsertArgs, Verb,
+    VerbArgs, VerbDecl, VerbOutcome,
 };
+use plugin_toolkit::schemars::{JsonSchema, schema_for};
+use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, Value, json};
 
 use crate::tools::{enabled_endpoints, make_client};
 
 const KIND: &str = "stack";
+
+/// Typed payload for `Create { action: "deploy" }` and `Upsert { action: "set" }`
+/// — everything dockge's `deployStack` (`docker compose up -d`) needs. `create`
+/// always adds a fresh stack; `upsert` decides add-vs-update from whether the
+/// named stack already exists on the endpoint.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
+pub struct StackDeployPayload {
+    /// Registered dockge endpoint (instance name) to deploy on.
+    pub endpoint: String,
+    /// Stack name — the compose project directory dockge creates.
+    pub name: String,
+    /// The `docker-compose.yaml` document.
+    pub compose_yaml: String,
+    /// Optional `.env` contents for the stack (default: empty).
+    #[serde(default)]
+    pub compose_env: String,
+}
 
 /// Lifecycle actions accepted on `Verb::Update` — each maps to dockge's
 /// single-arg `<op>Stack` event.
@@ -142,10 +163,54 @@ impl DockgeUnitProvider {
         }))
     }
 
-    fn do_create(&self, _args: CreateArgs) -> Result<VerbOutcome> {
-        Err(anyhow::anyhow!(
-            "stack create (deployStack) needs multi-arg socket emit; not yet supported"
-        ))
+    /// Parse the shared deploy payload from a create/upsert args string.
+    fn parse_deploy_payload(raw: Option<String>) -> Result<StackDeployPayload> {
+        let raw = raw.ok_or_else(|| anyhow::anyhow!("deploy requires a payload"))?;
+        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("deploy payload: {e}"))
+    }
+
+    /// Deploy a stack. `is_add` = true creates a fresh stack (dockge errors if it
+    /// already exists); false updates an existing one.
+    async fn deploy(p: StackDeployPayload, is_add: bool) -> Result<VerbOutcome> {
+        let client = make_client(&p.endpoint)?;
+        client
+            .deploy_stack(&p.name, &p.compose_yaml, &p.compose_env, is_add)
+            .await?;
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            Self::unit_id(&p.endpoint, &p.name),
+            serde_json::to_string(&json!({
+                "endpoint": p.endpoint,
+                "stack": p.name,
+                "deployed": true,
+            }))
+            .unwrap_or_default(),
+        )))
+    }
+
+    async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
+        if args.action != "deploy" {
+            return Err(anyhow::anyhow!(
+                "unknown stack create action: {}",
+                args.action
+            ));
+        }
+        let p = Self::parse_deploy_payload(args.payload)?;
+        // Create is add-only: dockge rejects deploying over an existing stack.
+        Self::deploy(p, true).await
+    }
+
+    /// Idempotent create-or-update: add the stack if absent on the endpoint,
+    /// otherwise redeploy over the existing one.
+    async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
+        let p = Self::parse_deploy_payload(args.payload)?;
+        let client = make_client(&p.endpoint)?;
+        let exists = client
+            .list_stacks()
+            .await
+            .ok()
+            .and_then(|v| v.as_object().map(|o| o.contains_key(&p.name)))
+            .unwrap_or(false);
+        Self::deploy(p, !exists).await
     }
 }
 
@@ -177,6 +242,24 @@ impl UnitProvider for DockgeUnitProvider {
                     query_schema: None,
                     actions: vec![],
                 },
+                VerbDecl {
+                    verb: Verb::Create,
+                    query_schema: None,
+                    actions: vec![ActionDecl {
+                        action: "deploy".into(),
+                        payload_schema: Some(schema_for!(StackDeployPayload)),
+                        response_schema: None,
+                    }],
+                },
+                VerbDecl {
+                    verb: Verb::Upsert,
+                    query_schema: None,
+                    actions: vec![ActionDecl {
+                        action: "set".into(),
+                        payload_schema: Some(schema_for!(StackDeployPayload)),
+                        response_schema: None,
+                    }],
+                },
             ],
         }]
     }
@@ -202,7 +285,8 @@ impl UnitProvider for DockgeUnitProvider {
                 VerbArgs::Detail(a) => self.do_detail(a).await,
                 VerbArgs::Update(a) => self.do_update(a).await,
                 VerbArgs::Delete(a) => self.do_delete(a).await,
-                VerbArgs::Create(a) => self.do_create(a),
+                VerbArgs::Create(a) => self.do_create(a).await,
+                VerbArgs::Upsert(a) => self.do_upsert(a).await,
             }
         })
     }
