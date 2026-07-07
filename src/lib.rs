@@ -7,7 +7,8 @@
 //! vocabulary.
 //!
 //! Surface: dockge registers real domain backends (see [`registration`]) —
-//! `unit` (compose stacks as managed units on the five-verb surface), plus the
+//! `unit` (compose stacks as managed units on the five-verb surface) and
+//! `topology` (one claim per stack per endpoint, for fleet inventory), plus the
 //! endpoint registry `dockge.{list,detail,create,update,delete}` (the dockge
 //! *instances*). No bespoke **stack** verbs — stacks ride the generic unit
 //! surface.
@@ -23,6 +24,7 @@
 pub mod abi_export;
 pub mod registration;
 pub mod tools;
+pub mod topology;
 pub mod unit_provider;
 
 use std::sync::{Arc, Mutex};

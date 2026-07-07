@@ -76,12 +76,24 @@ Every compose **stack** on every registered instance is surfaced as a `stack` **
 | `update` | `down` | tear the stack down |
 | `update` | `update` | pull + redeploy the stack |
 | `delete` | — | remove the stack |
+| `create` | `deploy` | register + deploy a new stack (`deployStack`, add-only) |
+| `upsert` | `set` | deploy the stack, adding it if absent else redeploying |
 
-> Stack **create** (`deployStack`) needs a multi-argument Socket.IO emit and is a toolkit follow-up; every single-arg lifecycle action above works today.
+### Topology
+
+dockge also registers a `topology` collector: one claim per stack per enabled
+instance, so the fleet inventory records **which dockge host runs which stack**
+(`provider_instance` = the instance name). dockge's remote Socket.IO surface
+exposes no container network details, so these claims carry no MACs — they make
+the stack layer visible in topology, while MAC-based parent nesting comes from
+the co-located `docker`/`proxmox` collector on the host.
 
 ### Follow-ups
 
-Deploy/backup/restore of the **dockge app itself** and stack **create** land as a `service` domain backend + a multi-arg emit — surfaced through orca's generic `service.*` / `unit.create`, still with no bespoke verbs.
+Deploy/backup/restore of the **dockge app itself** lands as a `service` domain
+backend, and each dockge instance as a `deploy_target` for stacks — both
+surfaced through orca's generic `service.*` / `deploy.*`, still with no bespoke
+verbs.
 
 ---
 
@@ -90,7 +102,8 @@ Deploy/backup/restore of the **dockge app itself** and stack **create** land as 
 - `src/lib.rs` — the Socket.IO [`Client`] (dockge's event vocabulary over orca's transport).
 - `src/tools.rs` — the `dockge.*` endpoint registry (`endpoint_resource!`).
 - `src/unit_provider.rs` — stacks-as-units on the five-verb surface.
-- `src/registration.rs` — the `unit` domain-backend descriptor + FFI dispatch.
+- `src/registration.rs` — the `unit` + `topology` domain-backend descriptors + FFI dispatch.
+- `src/topology.rs` — the topology collector (one claim per stack per endpoint).
 - `compose.yml` — standalone deployment.
 - `scripts/` — provisioning / backup / restore helpers (the standalone path).
 - `assets/` — plugin icon.
