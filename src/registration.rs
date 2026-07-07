@@ -15,10 +15,8 @@
 
 use std::sync::OnceLock;
 
-use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::contract::unit::{self as unit_domain, UnitProvider};
-use plugin_toolkit::export::runtime;
-use plugin_toolkit::serde_json;
+use plugin_toolkit::contract::unit::UnitProvider;
+use plugin_toolkit::export::{dispatch_unit_op, unit_backends_json};
 
 use crate::unit_provider::DockgeUnitProvider;
 
@@ -32,13 +30,7 @@ fn unit_provider() -> &'static DockgeUnitProvider {
 /// Backend descriptors this plugin advertises: a unit provider surfacing dockge
 /// compose stacks, routed back under its own prefix.
 pub fn backends_json() -> String {
-    let defs = vec![BackendDef {
-        domain: "unit".to_string(),
-        name: "dockge".to_string(),
-        invoke_prefix: UNIT_PREFIX.to_string(),
-        ..Default::default()
-    }];
-    serde_json::to_string(&defs).unwrap_or_else(|_| "[]".to_string())
+    unit_backends_json(unit_provider() as &dyn UnitProvider, UNIT_PREFIX)
 }
 
 /// Handle the loader's `dockge.__unit.*` backend calls. Returns `None` for
@@ -50,12 +42,11 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         .strip_prefix(UNIT_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
     {
-        let out = runtime().block_on(unit_domain::dispatch_op(
+        return Some(dispatch_unit_op(
             unit_provider() as &dyn UnitProvider,
             op,
             args_json,
         ));
-        return Some(out);
     }
     None
 }
