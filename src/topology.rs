@@ -22,7 +22,7 @@
 use plugin_toolkit::anyhow::Result;
 use plugin_toolkit::contract::TopologyClaim;
 
-use crate::tools::{enabled_endpoints, make_client};
+use crate::tools::{enabled_endpoint_rows, make_client};
 
 /// Provider name registered in the topology registry.
 const PROVIDER: &str = "dockge";
@@ -36,14 +36,22 @@ const KIND: &str = "stack";
 /// logged and skipped, never aborting the rest.
 pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
     let mut claims = Vec::new();
-    for ep in enabled_endpoints()? {
-        let client = match make_client(&ep) {
+    for row in enabled_endpoint_rows()? {
+        let ep = &row.name;
+        let client = match make_client(ep) {
             Ok(c) => c,
             Err(e) => {
                 plugin_toolkit::tracing::warn!("dockge topology endpoint {ep}: {e}");
                 continue;
             }
         };
+        // The host this instance (and therefore its stacks) runs on, derived
+        // from the endpoint's `base_url`. `None` for a local instance
+        // (localhost) — the inventory layer then parents stacks to the
+        // reporting peer, which IS the host. For a remote instance the
+        // resolved host lets inventory attribute stacks to the right node
+        // regardless of which daemon collected them.
+        let runs_on = runs_on_from_base_url(&row.base_url);
         match client.list_stacks().await {
             Ok(list) => {
                 if let Some(obj) = list.as_object() {
@@ -56,6 +64,7 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
                             macs: Vec::new(),
                             provider: PROVIDER.to_string(),
                             provider_instance: ep.clone(),
+                            runs_on: runs_on.clone(),
                         });
                     }
                 }
@@ -66,4 +75,63 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
         }
     }
     Ok(claims)
+}
+
+/// Extract the host segment of a dockge `base_url` for `TopologyClaim.runs_on`.
+/// Returns `None` for loopback hosts (the reporting peer is the host) and for
+/// unparseable input. The inventory layer matches the returned host against
+/// each peer's hostname and network addresses, so an IP or hostname both work.
+fn runs_on_from_base_url(base_url: &str) -> Option<String> {
+    // Strip scheme.
+    let rest = base_url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(base_url);
+    // Authority is everything up to the first '/'.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Drop any userinfo (`user:pass@host`).
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Drop the port. Bracketed IPv6 (`[::1]:5001`) keeps the brackets' contents.
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(stripped)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    let host = host.trim();
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runs_on_from_base_url;
+
+    #[test]
+    fn loopback_hosts_yield_none() {
+        assert_eq!(runs_on_from_base_url("http://localhost:5001"), None);
+        assert_eq!(runs_on_from_base_url("http://127.0.0.1:5001"), None);
+        assert_eq!(runs_on_from_base_url("http://[::1]:5001"), None);
+    }
+
+    #[test]
+    fn remote_hostname_and_ip_extracted() {
+        assert_eq!(
+            runs_on_from_base_url("http://freyr:5001"),
+            Some("freyr".to_string())
+        );
+        assert_eq!(
+            runs_on_from_base_url("https://10.10.10.15:5001/"),
+            Some("10.10.10.15".to_string())
+        );
+        assert_eq!(
+            runs_on_from_base_url("http://user:pass@baldur:5001"),
+            Some("baldur".to_string())
+        );
+    }
 }
