@@ -51,9 +51,17 @@ pub(crate) fn make_client(name: &str) -> Result<Client> {
 
 /// Names of all registered, enabled dockge endpoints.
 pub(crate) fn enabled_endpoints() -> Result<Vec<String>> {
+    Ok(enabled_endpoint_rows()?
+        .into_iter()
+        .map(|r| r.name)
+        .collect())
+}
+
+/// Full rows of all registered, enabled dockge endpoints. The topology
+/// collector needs `base_url` to report which host each instance runs on.
+pub(crate) fn enabled_endpoint_rows() -> Result<Vec<DockgeEndpoint>> {
     Ok(endpoint_db::list()?
         .into_iter()
         .filter(|r| r.enabled)
-        .map(|r| r.name)
         .collect())
 }
