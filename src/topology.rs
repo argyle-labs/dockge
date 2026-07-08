@@ -65,6 +65,10 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
                             provider: PROVIDER.to_string(),
                             provider_instance: ep.clone(),
                             runs_on: runs_on.clone(),
+                            // Dockge's remote surface exposes no container
+                            // network detail; a dockge host also running the
+                            // local docker plugin gets ports via that collector.
+                            ..Default::default()
                         });
                     }
                 }
