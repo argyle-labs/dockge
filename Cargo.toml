@@ -33,7 +33,7 @@ crate-type = ["cdylib", "rlib"]
 # `plugin_toolkit::urlencoding` re-export + endpoint_resource! macro). Until a
 # checkout of orca exists at ../orca, the committed `[patch]` in
 # `.cargo/config.toml` resolves this to the local in-tree toolkit.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", features = ["socketio"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "socketio"] }
 
 # The ONE genuine non-orca dep: `#[export_root_module]` expands to bare
 # `::abi_stable` paths in this crate's root (the cdylib FFI boundary the loader
@@ -45,7 +45,7 @@ abi_stable = "0.11"
 [dev-dependencies]
 # Dev-only: the in-crate tests reach serde_json + tokio. The env-gated
 # integration test (`DOCKGE_TEST_URL`) drives a live dockge over Socket.IO.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", features = ["socketio"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "socketio"] }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # Match orca's workspace lint floor: discarding a Result/Option via
