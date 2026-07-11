@@ -47,7 +47,7 @@ orca reaches dockge instances over the network. There are **two surfaces**, both
 
 ### 1. Register instances — the endpoint registry
 
-`dockge.*` is the registry of dockge **instances** (each with a network address + login). The password is stored via orca's **secrets domain**, never plaintext in the row.
+`dockge.*` is the registry of dockge **instances** (each with a network address + login). The password is stored in the secrets domain.
 
 | command | what it does |
 | --- | --- |
