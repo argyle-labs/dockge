@@ -278,7 +278,7 @@ async fn wait_for_slot(slot: &Arc<Mutex<Option<Value>>>) -> Option<Value> {
         {
             return Some(v);
         }
-        plugin_toolkit::tokio::time::sleep(Duration::from_millis(100)).await;
+        plugin_toolkit::time::sleep(Duration::from_millis(100)).await;
     }
     None
 }
