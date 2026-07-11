@@ -600,7 +600,6 @@ dependencies = [
 name = "dockge"
 version = "0.1.0"
 dependencies = [
- "abi_stable",
  "plugin-toolkit",
  "tokio",
 ]
@@ -1434,7 +1433,7 @@ dependencies = [
  "deploy-target",
  "derive",
  "dispatch",
- "futures-executor",
+ "futures-core",
  "futures-util",
  "inventory",
  "macro-runtime",
