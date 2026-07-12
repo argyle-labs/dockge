@@ -261,6 +261,9 @@ impl UnitProvider for DockgeUnitProvider {
                     }],
                 },
             ],
+            // Dockge manages compose stacks it deploys itself; it declares no
+            // restore-sufficient state to core's backup layer.
+            backup_spec: None,
         }]
     }
 
