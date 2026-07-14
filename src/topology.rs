@@ -130,8 +130,8 @@ mod tests {
             Some("freyr".to_string())
         );
         assert_eq!(
-            runs_on_from_base_url("https://10.10.10.15:5001/"),
-            Some("10.10.10.15".to_string())
+            runs_on_from_base_url("https://192.0.2.15:5001/"),
+            Some("192.0.2.15".to_string())
         );
         assert_eq!(
             runs_on_from_base_url("http://user:pass@baldur:5001"),
