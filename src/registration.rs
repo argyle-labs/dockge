@@ -22,8 +22,9 @@
 use std::sync::OnceLock;
 
 use plugin_toolkit::abi::BackendDef;
-use plugin_toolkit::contract::unit::UnitProvider;
-use plugin_toolkit::export::{dispatch_unit_op, runtime, topology_backend_def, unit_backend_def};
+use plugin_toolkit::backend_def::{topology_backend_def, unit_backend_def};
+use plugin_toolkit::contract::unit::{self, UnitProvider};
+use plugin_toolkit::reactor;
 use plugin_toolkit::serde_json;
 
 use crate::unit_provider::DockgeUnitProvider;
@@ -57,11 +58,11 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         .strip_prefix(UNIT_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
     {
-        return Some(dispatch_unit_op(
+        return Some(reactor::block_on(unit::dispatch_op(
             unit_provider() as &dyn UnitProvider,
             op,
             args_json,
-        ));
+        )));
     }
     if let Some(op) = name
         .strip_prefix(TOPO_PREFIX)
@@ -75,9 +76,8 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
 fn dispatch_topology(op: &str) -> Result<String, String> {
     match op {
         "collect_claims" => {
-            let claims = runtime()
-                .block_on(crate::topology::collect_claims())
-                .map_err(|e| e.to_string())?;
+            let claims =
+                reactor::block_on(crate::topology::collect_claims()).map_err(|e| e.to_string())?;
             serde_json::to_string(&claims).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown topology op: {other}")),
