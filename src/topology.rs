@@ -65,6 +65,16 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
                             provider: PROVIDER.to_string(),
                             provider_instance: ep.clone(),
                             runs_on: runs_on.clone(),
+                            // Cross-plugin dedup key. dockge manages each stack
+                            // as a compose project rooted at `/opt/stacks/<name>`
+                            // — the same directory the co-located docker plugin
+                            // reads from `com.docker.compose.project.working_dir`.
+                            // Routing both providers through the shared
+                            // `normalize_service_identity` helper (identical
+                            // host scope + working-dir signal) yields a
+                            // BYTE-IDENTICAL key, so core collapses the docker
+                            // and dockge views onto one stack node.
+                            service_identity: stack_service_identity(runs_on.as_deref(), name),
                             // Dockge's remote surface exposes no container
                             // network detail; a dockge host also running the
                             // local docker plugin gets ports via that collector.
@@ -79,6 +89,38 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
         }
     }
     Ok(claims)
+}
+
+/// Filesystem root under which dockge lays out every managed compose stack:
+/// one directory per project at `/opt/stacks/<project>`. This is the same path
+/// the co-located docker plugin observes as `com.docker.compose.project.working_dir`,
+/// so building the correlation key from it makes the two providers agree.
+const STACKS_ROOT: &str = "/opt/stacks";
+
+/// Build the cross-plugin `service_identity` correlation key for a dockge stack.
+///
+/// Delegates to [`TopologyClaim::normalize_service_identity`] so the output is
+/// byte-identical to what the docker plugin produces for the same stack on the
+/// same host: the host scope plus the normalized compose working directory
+/// `/opt/stacks/<name>`. The bare `name` is also passed as the project
+/// fallback, matching docker's `com.docker.compose.project`.
+///
+/// Host scope MUST match how docker scopes its own compose claims. Docker
+/// stamps the actual hostname via [`plugin_toolkit::containers::local_hostname`]
+/// (e.g. `"baldur"`). So for a **co-located** dockge instance (`runs_on` is
+/// `None` — a localhost `base_url`, the reporting peer IS the host) we scope by
+/// that same `local_hostname()` rather than an empty string; otherwise the two
+/// providers on the same physical box would emit divergent keys
+/// (`\u{1f}/opt/stacks/<name>` vs `baldur\u{1f}/opt/stacks/<name>`) and core
+/// dedup would fail. For a genuinely **remote** instance we keep the resolved
+/// remote host from `base_url`, since that box — not this reporter — runs the
+/// stack. Returns `None` only if the stack name is blank.
+fn stack_service_identity(host: Option<&str>, name: &str) -> Option<String> {
+    let working_dir = format!("{STACKS_ROOT}/{name}");
+    // Co-located instance: scope by the actual local hostname, the SAME function
+    // docker uses, so the keys converge byte-for-byte.
+    let host_scope = host.unwrap_or_else(|| plugin_toolkit::containers::local_hostname());
+    TopologyClaim::normalize_service_identity(host_scope, Some(&working_dir), Some(name))
 }
 
 /// Extract the host segment of a dockge `base_url` for `TopologyClaim.runs_on`.
@@ -114,7 +156,49 @@ fn runs_on_from_base_url(base_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::runs_on_from_base_url;
+    use super::{runs_on_from_base_url, stack_service_identity};
+    use plugin_toolkit::contract::TopologyClaim;
+
+    #[test]
+    fn service_identity_matches_normalized_opt_stacks_form() {
+        // The emitted key must equal what docker derives on the same host from
+        // `com.docker.compose.project.working_dir = /opt/stacks/<name>`, routed
+        // through the shared core helper — byte-for-byte, so core dedups them.
+        let got = stack_service_identity(Some("freyr"), "arr");
+        let docker_equiv = TopologyClaim::normalize_service_identity(
+            "freyr",
+            Some("/opt/stacks/arr"),
+            Some("arr"),
+        );
+        assert_eq!(got, docker_equiv);
+        assert_eq!(got.as_deref(), Some("freyr\u{1f}/opt/stacks/arr"));
+    }
+
+    #[test]
+    fn service_identity_colocated_host_uses_local_hostname() {
+        // A co-located instance reports `runs_on = None`; the reporting peer IS
+        // the host. The key must scope by the actual local hostname — the SAME
+        // `plugin_toolkit::containers::local_hostname()` the docker plugin
+        // stamps on its own compose claims — so the two providers on the same
+        // box emit BYTE-IDENTICAL keys and core dedups them. An empty scope here
+        // (the old behavior) forked the key from docker's and broke dedup.
+        let host = plugin_toolkit::containers::local_hostname();
+        let got = stack_service_identity(None, "media");
+        // Docker derives the same key from `local_hostname()` +
+        // `working_dir = /opt/stacks/media`, routed through the shared helper.
+        let docker_equiv = TopologyClaim::normalize_service_identity(
+            host,
+            Some("/opt/stacks/media"),
+            Some("media"),
+        );
+        assert_eq!(got, docker_equiv);
+        // Host scope is normalized (lowercased) but never empty.
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("{}\u{1f}/opt/stacks/media", host.to_ascii_lowercase()).as_str())
+        );
+        assert!(!got.as_deref().unwrap().starts_with('\u{1f}'));
+    }
 
     #[test]
     fn loopback_hosts_yield_none() {
