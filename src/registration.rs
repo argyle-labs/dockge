@@ -53,7 +53,10 @@ pub fn backends_json() -> String {
 /// Returns `None` for anything else so the toolkit falls through to the
 /// `dockge.` tool surface. Async work runs on the toolkit's shared runtime
 /// behind the synchronous FFI boundary.
-pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
+pub fn backend_dispatch(
+    name: &str,
+    args: serde_json::Value,
+) -> Option<Result<serde_json::Value, serde_json::Value>> {
     if let Some(op) = name
         .strip_prefix(UNIT_PREFIX)
         .and_then(|s| s.strip_prefix('.'))
@@ -61,7 +64,7 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
         return Some(reactor::block_on(unit::dispatch_op(
             unit_provider() as &dyn UnitProvider,
             op,
-            args_json,
+            args,
         )));
     }
     if let Some(op) = name
@@ -73,13 +76,15 @@ pub fn backend_dispatch(name: &str, args_json: &str) -> Option<Result<String, St
     None
 }
 
-fn dispatch_topology(op: &str) -> Result<String, String> {
+fn dispatch_topology(op: &str) -> Result<serde_json::Value, serde_json::Value> {
     match op {
         "collect_claims" => {
-            let claims =
-                reactor::block_on(crate::topology::collect_claims()).map_err(|e| e.to_string())?;
-            serde_json::to_string(&claims).map_err(|e| e.to_string())
+            let claims = reactor::block_on(crate::topology::collect_claims())
+                .map_err(|e| serde_json::Value::String(e.to_string()))?;
+            serde_json::to_value(&claims).map_err(|e| serde_json::Value::String(e.to_string()))
         }
-        other => Err(format!("unknown topology op: {other}")),
+        other => Err(serde_json::Value::String(format!(
+            "unknown topology op: {other}"
+        ))),
     }
 }
