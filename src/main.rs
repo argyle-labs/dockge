@@ -1,20 +1,25 @@
 //! Dynamic (subprocess) entrypoint for the dockge plugin.
 //!
-//! The toolkit's `serve_tool_plugin!` emits `fn main`, serving this plugin over
-//! the orca socket. The plugin is a `[[bin]]`, owns no runtime, and reaches
-//! orca only through the
-//! socket.
-//!
-//! dockge is a **hybrid** plugin: the `dockge.` endpoint-registry tool surface
-//! PLUS one domain backend — a `unit` provider surfacing compose stacks across
-//! every registered instance (see [`dockge::registration`]). The hybrid arm
-//! serves the `dockge.`-scoped manifest and an `invoke` that tries the backend
-//! dispatch first (the `dockge.__unit.*` calls the loader makes) then falls
-//! through to tool dispatch.
+//! dockge is a **hybrid** plugin: the `dockge.` endpoint-registry `#[orca_tool]`
+//! surface PLUS two typed domain backends — a `unit` provider (compose stacks
+//! across every registered instance) and a `topology` collector (one claim per
+//! stack per endpoint). All three are registered on the [`Plugin`] builder, which
+//! emits the combined `backends()` payload and the wire dispatch. The plugin
+//! hand-writes no op-string routing.
 
-plugin_toolkit::serve_tool_plugin! {
-    name: "dockge",
-    target_compat: "1.x",
-    backends: dockge::registration::backends_json(),
-    backend_dispatch: dockge::registration::backend_dispatch,
+plugin_toolkit::instrument::bootstrap!();
+
+use plugin_toolkit::plugin::Plugin;
+
+// Force-link the `dockge.` #[orca_tool] surface so its inventory (a separate
+// module from the backends referenced below) isn't dead-stripped at link time.
+use dockge as _;
+
+fn main() -> plugin_toolkit::anyhow::Result<()> {
+    Plugin::named("dockge")
+        .version(env!("CARGO_PKG_VERSION"))
+        .tools(["dockge."])
+        .unit(dockge::unit_provider::DockgeUnitProvider::new())
+        .topology(dockge::topology::DockgeTopology)
+        .serve()
 }
