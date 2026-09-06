@@ -21,11 +21,27 @@
 
 use plugin_toolkit::anyhow::Result;
 use plugin_toolkit::contract::TopologyClaim;
+use plugin_toolkit::contract::topology::TopologyCollector;
 
 use crate::tools::{enabled_endpoint_rows, make_client};
 
 /// Provider name registered in the topology registry.
 const PROVIDER: &str = "dockge";
+
+/// Typed topology facet: registered on the `Plugin` builder, which drives it over
+/// the wire via `contract::topology::dispatch_op` — no hand-written op routing.
+pub struct DockgeTopology;
+
+#[plugin_toolkit::async_trait::async_trait]
+impl TopologyCollector for DockgeTopology {
+    fn name(&self) -> &str {
+        PROVIDER
+    }
+
+    async fn collect_claims(&self) -> Result<Vec<TopologyClaim>> {
+        collect_claims().await
+    }
+}
 /// Dockge manages compose projects; each stack is a group of containers, but the
 /// claim kind mirrors the generic unit vocabulary (`stack`) so it aligns with
 /// how the unit surface and the `deploy_target` domain name the same thing.

@@ -21,7 +21,6 @@
 // Socket.IO frames are dynamic JSON; Value lives only at this transport edge.
 #![allow(clippy::disallowed_types)]
 
-pub mod registration;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
