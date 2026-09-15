@@ -173,8 +173,13 @@ impl DockgeUnitProvider {
     /// already exists); false updates an existing one.
     async fn deploy(p: StackDeployPayload, is_add: bool) -> Result<VerbOutcome> {
         let client = make_client(&p.endpoint)?;
+        // Force `rslave` propagation on bind mounts so a host CIFS/NFS remount
+        // propagates INTO the container (orca #402 Part B). Never block a
+        // deploy on this transform — fall back to the original YAML.
+        let compose_yaml = crate::compose_mounts::ensure_bind_propagation(&p.compose_yaml)
+            .unwrap_or_else(|_| p.compose_yaml.clone());
         client
-            .deploy_stack(&p.name, &p.compose_yaml, &p.compose_env, is_add)
+            .deploy_stack(&p.name, &compose_yaml, &p.compose_env, is_add)
             .await?;
         Ok(VerbOutcome::Item(ItemOutcome::new(
             Self::unit_id(&p.endpoint, &p.name),
