@@ -37,6 +37,9 @@ path = "src/main.rs"
 # checkout of orca exists at ../orca, the committed `[patch]` in
 # `.cargo/config.toml` resolves this to the local in-tree toolkit.
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "socketio", "containers"] }
+# Order-preserving compose-YAML rewrite for bind-mount propagation (orca #402
+# Part B). Reuses the serde the toolkit already re-exports — no second copy.
+serde_yaml = "0.9"
 
 [dev-dependencies]
 # Dev-only: the in-crate tests reach serde_json + tokio. The env-gated
