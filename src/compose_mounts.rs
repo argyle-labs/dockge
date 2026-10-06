@@ -67,7 +67,7 @@ fn rewrite_volume(entry: &mut Value) -> bool {
 }
 
 /// True if `src` is a host path (bind), not a named volume.
-fn is_host_path(src: &str) -> bool {
+pub(crate) fn is_host_path(src: &str) -> bool {
     src.starts_with('/') || src.starts_with("./") || src.starts_with("../") || src.starts_with('~')
 }
 

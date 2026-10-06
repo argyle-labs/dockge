@@ -5,11 +5,15 @@
 //! `dockge@<endpoint>` — `invoke` parses the endpoint out of it and drives the
 //! right instance over Socket.IO. Each stack is a `stack` kind unit. Verbs map:
 //! - [`Verb::List`]   → every stack on every enabled endpoint
-//! - [`Verb::Detail`] → one stack's compose YAML / env / status
+//! - [`Verb::Detail`] → one stack's compose YAML / env / status, plus what it
+//!   leaves without orca's ownership labels
 //! - [`Verb::Update`] → action `start` / `stop` / `restart` / `down` / `update`
 //! - [`Verb::Delete`] → remove the stack
 //! - [`Verb::Create`] → action `deploy`: `deployStack` a new stack (add-only)
 //! - [`Verb::Upsert`] → action `set`: deploy add-if-absent, else update
+//!
+//! Deploys merge orca's ownership labels into the compose (see
+//! [`crate::ownership`]) and are dry runs unless the payload sets `execute`.
 //!
 //! Enumeration is resilient: an unreachable or failing endpoint is skipped
 //! (logged), never fatal to the whole list.
@@ -26,6 +30,8 @@ use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, Value, json};
 
+use crate::Client;
+use crate::ownership::{Labeled, Previous};
 use crate::tools::{enabled_endpoints, make_client};
 
 const KIND: &str = "stack";
@@ -47,6 +53,10 @@ pub struct StackDeployPayload {
     /// Optional `.env` contents for the stack (default: empty).
     #[serde(default)]
     pub compose_env: String,
+    /// Deploy. Omitted, returns the compose that would be sent and its diff
+    /// against `compose_yaml`, and changes nothing.
+    #[serde(default)]
+    pub execute: bool,
 }
 
 /// Lifecycle actions accepted on `Verb::Update` — each maps to dockge's
@@ -132,7 +142,17 @@ impl DockgeUnitProvider {
     async fn do_detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
         let ep = Self::endpoint_of(&args.id.manager).to_string();
         let client = make_client(&ep)?;
-        let stack = client.get_stack(&args.id.id).await?;
+        let mut stack = client.get_stack(&args.id.id).await?;
+        let ownership = match stack.pointer("/stack/composeYAML").and_then(Value::as_str) {
+            Some(yaml) => match crate::ownership::audit(yaml) {
+                Ok(c) => json!({ "complete": c.is_complete(), "unlabeled": c }),
+                Err(e) => json!({ "error": format!("{e:#}") }),
+            },
+            None => json!({ "error": "dockge returned no compose for this stack" }),
+        };
+        if let Some(obj) = stack.as_object_mut() {
+            obj.insert("ownership".into(), ownership);
+        }
         Ok(VerbOutcome::Item(ItemOutcome::new(
             args.id,
             serde_json::to_string(&stack).unwrap_or_default(),
@@ -169,26 +189,61 @@ impl DockgeUnitProvider {
         serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("deploy payload: {e}"))
     }
 
-    /// Deploy a stack. `is_add` = true creates a fresh stack (dockge errors if it
-    /// already exists); false updates an existing one.
-    async fn deploy(p: StackDeployPayload, is_add: bool) -> Result<VerbOutcome> {
-        let client = make_client(&p.endpoint)?;
+    /// The compose actually sent to dockge for `p`: bind propagation forced
+    /// and ownership labels merged in.
+    fn prepare(p: &StackDeployPayload, previous: Previous<'_>) -> Result<Labeled> {
         // Force `rslave` propagation on bind mounts so a host CIFS/NFS remount
         // propagates INTO the container (orca #402 Part B). Never block a
         // deploy on this transform — fall back to the original YAML.
         let compose_yaml = crate::compose_mounts::ensure_bind_propagation(&p.compose_yaml)
             .unwrap_or_else(|_| p.compose_yaml.clone());
-        client
-            .deploy_stack(&p.name, &compose_yaml, &p.compose_env, is_add)
-            .await?;
-        Ok(VerbOutcome::Item(ItemOutcome::new(
-            Self::unit_id(&p.endpoint, &p.name),
-            serde_json::to_string(&json!({
+        crate::ownership::label(&compose_yaml, &p.name, previous)
+    }
+
+    /// Deploy a stack. `is_add` = true creates a fresh stack (dockge errors if it
+    /// already exists); false updates an existing one. A dry run unless
+    /// `p.execute`.
+    async fn deploy(
+        client: &Client,
+        p: StackDeployPayload,
+        is_add: bool,
+        previous: Previous<'_>,
+    ) -> Result<VerbOutcome> {
+        let labeled = Self::prepare(&p, previous)?;
+        let body = if p.execute {
+            let ack = client
+                .deploy_stack(&p.name, &labeled.yaml, &p.compose_env, is_add)
+                .await?;
+            if !crate::ack_ok(&ack) {
+                return Err(anyhow::anyhow!(
+                    "dockge rejected deploy of {} on {}: {}",
+                    p.name,
+                    p.endpoint,
+                    crate::ack_msg(&ack)
+                ));
+            }
+            json!({
                 "endpoint": p.endpoint,
                 "stack": p.name,
+                "dryRun": false,
                 "deployed": true,
-            }))
-            .unwrap_or_default(),
+                "notes": labeled.notes,
+            })
+        } else {
+            json!({
+                "endpoint": p.endpoint,
+                "stack": p.name,
+                "dryRun": true,
+                "deployed": false,
+                "add": is_add,
+                "diff": crate::ownership::diff(&p.compose_yaml, &labeled.yaml),
+                "composeYaml": labeled.yaml,
+                "notes": labeled.notes,
+            })
+        };
+        Ok(VerbOutcome::Item(ItemOutcome::new(
+            Self::unit_id(&p.endpoint, &p.name),
+            serde_json::to_string(&body).unwrap_or_default(),
         )))
     }
 
@@ -200,8 +255,9 @@ impl DockgeUnitProvider {
             ));
         }
         let p = Self::parse_deploy_payload(args.payload)?;
+        let client = make_client(&p.endpoint)?;
         // Create is add-only: dockge rejects deploying over an existing stack.
-        Self::deploy(p, true).await
+        Self::deploy(&client, p, true, Previous::New).await
     }
 
     /// Idempotent create-or-update: add the stack if absent on the endpoint,
@@ -215,7 +271,18 @@ impl DockgeUnitProvider {
             .ok()
             .and_then(|v| v.as_object().map(|o| o.contains_key(&p.name)))
             .unwrap_or(false);
-        Self::deploy(p, !exists).await
+        if !exists {
+            return Self::deploy(&client, p, true, Previous::New).await;
+        }
+        let current = client.get_stack(&p.name).await.ok().and_then(|s| {
+            s.pointer("/stack/composeYAML")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        let previous = current
+            .as_deref()
+            .map_or(Previous::Unknown, Previous::Compose);
+        Self::deploy(&client, p, false, previous).await
     }
 }
 
@@ -316,6 +383,32 @@ mod tests {
     #[test]
     fn endpoint_of_tolerates_bare_manager() {
         assert_eq!(DockgeUnitProvider::endpoint_of("freyr"), "freyr");
+    }
+
+    fn payload(yaml: &str) -> StackDeployPayload {
+        DockgeUnitProvider::parse_deploy_payload(Some(
+            json!({ "endpoint": "baldur", "name": "media", "compose_yaml": yaml }).to_string(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn deploy_payload_defaults_to_dry_run() {
+        assert!(!payload("services: {}\n").execute);
+    }
+
+    #[test]
+    fn prepare_labels_and_forces_bind_propagation() {
+        let p =
+            payload("services:\n  app:\n    image: x\n    volumes:\n      - /srv/media:/data\n");
+        let l = DockgeUnitProvider::prepare(&p, Previous::New).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&l.yaml).unwrap();
+        let app = &v["services"]["app"];
+        assert_eq!(app["volumes"][0]["bind"]["propagation"], "rslave");
+        assert_eq!(app["labels"][crate::labels::OWNER], "dockge");
+        assert_eq!(app["labels"][crate::labels::UNIT], "media");
+        let d = crate::ownership::diff(&p.compose_yaml, &l.yaml);
+        assert!(d.contains("+    labels:"), "{d}");
     }
 
     #[test]

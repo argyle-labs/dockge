@@ -69,7 +69,7 @@ Every compose **stack** on every registered instance is surfaced as a `stack` **
 | verb | action(s) | what it does |
 | --- | --- | --- |
 | `list` | — | every stack on every enabled instance |
-| `detail` | — | one stack's compose YAML / env / status |
+| `detail` | — | one stack's compose YAML / env / status, plus `ownership`: what it leaves without orca labels |
 | `update` | `start` | start the stack |
 | `update` | `stop` | stop the stack |
 | `update` | `restart` | restart the stack |
@@ -78,6 +78,15 @@ Every compose **stack** on every registered instance is surfaced as a `stack` **
 | `delete` | — | remove the stack |
 | `create` | `deploy` | register + deploy a new stack (`deployStack`, add-only) |
 | `upsert` | `set` | deploy the stack, adding it if absent else redeploying |
+
+`create` and `upsert` merge orca's ownership labels (`orca.managed`,
+`orca.owner=dockge`, `orca.stack`, `orca.service`, `orca.unit`, `orca.mount`)
+into the compose. Without `"execute": true` in the payload they change nothing
+and return the compose that would be sent plus its diff. Volumes and networks
+the stack already had without orca labels are not relabeled, since compose
+would recreate them. On a new stack, anonymous volumes become named volumes
+`<project>_<service>_<path-slug>`. The `update` action redeploys the stored
+compose unchanged; run `upsert` to label an existing stack.
 
 ### Topology
 

@@ -22,6 +22,8 @@
 #![allow(clippy::disallowed_types)]
 
 pub mod compose_mounts;
+pub mod labels;
+pub mod ownership;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
@@ -258,11 +260,11 @@ impl Client {
 }
 
 /// A dockge ack is `{ ok: bool, msg?: string, … }`.
-fn ack_ok(ack: &Value) -> bool {
+pub(crate) fn ack_ok(ack: &Value) -> bool {
     ack.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn ack_msg(ack: &Value) -> String {
+pub(crate) fn ack_msg(ack: &Value) -> String {
     ack.get("msg")
         .and_then(Value::as_str)
         .unwrap_or("no message")
