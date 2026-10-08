@@ -614,11 +614,14 @@ mod tests {
     #[test]
     fn block_scalars_behind_a_tag_or_anchor_are_text() {
         for header in ["!!str |", "&c |", "!!str &c >-", "&c !t |"] {
-            let src =
-                format!("a:\n  cmd: {header}\n    echo\n    # kept\n  - {header}\n    x\nb: 1\n");
+            let src = format!(
+                "a:\n  cmd: {header}\n    echo\n    # kept\nb:\n  - {header}\n    x\n    # also\nc: 1\n"
+            );
+            assert!(serde_yaml::from_str::<Value>(&src).is_ok(), "{header}");
             let t = Text::new(&src).unwrap();
-            assert_eq!(t.end(0), 5, "{header}");
-            assert!(t.body[3] && t.body[5] && !t.body[6], "{header}");
+            assert_eq!(t.end(0), 3, "{header}");
+            assert_eq!(t.end(4), 7, "{header}");
+            assert!(t.body[3] && t.body[7] && !t.body[8], "{header}");
         }
     }
 

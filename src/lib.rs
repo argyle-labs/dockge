@@ -223,6 +223,17 @@ impl Client {
         ack
     }
 
+    /// The stacks directory's `global.env`, which dockge passes to every
+    /// compose run before the stack's `.env`; empty when there is none.
+    pub async fn global_env(&self) -> Result<String> {
+        let session = self.session(None).await?;
+        let ack = session
+            .emit_ack_args("getSettings", Vec::new(), ACK_TIMEOUT)
+            .await;
+        session.disconnect().await.ok();
+        global_env(&ack.context("dockge getSettings")?)
+    }
+
     /// Create + deploy a stack (dockge `deployStack`: `docker compose up -d`).
     /// `is_add` = true for a new stack. Deploying pulls images + starts
     /// containers, so this uses a longer timeout than the ack ops.
@@ -254,6 +265,23 @@ impl Client {
             .await;
         session.disconnect().await.ok();
         ack
+    }
+}
+
+/// What dockge's `getSettings` reports as `globalENV` when there is no
+/// `global.env`.
+const GLOBAL_ENV_PLACEHOLDER: &str = "# VARIABLE=value #comment";
+
+/// The stacks directory's `global.env` from a `getSettings` ack; empty when
+/// dockge has none.
+fn global_env(ack: &Value) -> Result<String> {
+    if !ack_ok(ack) {
+        bail!("dockge refused getSettings: {}", ack_msg(ack));
+    }
+    match ack.pointer("/data/globalENV").and_then(Value::as_str) {
+        Some(GLOBAL_ENV_PLACEHOLDER) => Ok(String::new()),
+        Some(env) => Ok(env.to_string()),
+        None => bail!("dockge settings have no globalENV"),
     }
 }
 
@@ -317,6 +345,18 @@ mod tests {
         assert!(stack_list(&ok).unwrap().get("media").is_some());
         assert!(stack_list(&json!({ "ok": false, "msg": "no" })).is_err());
         assert!(stack_list(&json!({ "ok": true })).is_err());
+    }
+
+    #[test]
+    fn global_env_skips_the_placeholder_and_rejects_refusals() {
+        let ack = |env: &str| json!({ "ok": true, "data": { "globalENV": env } });
+        assert_eq!(
+            global_env(&ack("COMPOSE_PROJECT_NAME=tv\n")).unwrap(),
+            "COMPOSE_PROJECT_NAME=tv\n"
+        );
+        assert_eq!(global_env(&ack(GLOBAL_ENV_PLACEHOLDER)).unwrap(), "");
+        assert!(global_env(&json!({ "ok": false, "msg": "not logged in" })).is_err());
+        assert!(global_env(&json!({ "ok": true, "data": {} })).is_err());
     }
 
     #[test]

@@ -87,8 +87,10 @@ the stack already had without orca labels are not relabeled, since compose
 would recreate them. On a new stack, anonymous volumes become named volumes
 `<project>_<service>_<path-slug>`. Dockge runs `docker compose` in the
 stack's directory without `-p`, so the project is `COMPOSE_PROJECT_NAME` from
-the stack's env, else the compose `name:`, else the normalized stack name; an
-interpolated or non-normalized project name leaves the stack unlabeled. Every
+the stack's env, else dockge's `global.env` (read with `getSettings`), else
+the compose `name:`, else the normalized stack name. An interpolated or
+non-normalized project name, or a `global.env` that cannot be read, leaves the
+stack unlabeled. Every
 response lists the resources left without labels in `unlabeled`, with the
 reasons in `notes`. The `update` action redeploys the stored
 compose unchanged; run `upsert` to label an existing stack.

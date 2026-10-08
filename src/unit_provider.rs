@@ -31,7 +31,7 @@ use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, Value, json};
 
 use crate::Client;
-use crate::ownership::{Labeled, Previous};
+use crate::ownership::{EnvFiles, Labeled, Previous};
 use crate::tools::{enabled_endpoints, make_client};
 
 const KIND: &str = "stack";
@@ -143,15 +143,16 @@ impl DockgeUnitProvider {
         let ep = Self::endpoint_of(&args.id.manager).to_string();
         let client = make_client(&ep)?;
         let mut stack = client.get_stack(&args.id.id).await?;
+        let global = client.global_env().await.map_err(|e| format!("{e:#}"));
+        let env = EnvFiles {
+            global: global.as_deref().map_err(String::as_str),
+            stack: stack
+                .pointer("/stack/composeENV")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        };
         let ownership = match stack.pointer("/stack/composeYAML").and_then(Value::as_str) {
-            Some(yaml) => match crate::ownership::audit(
-                yaml,
-                &args.id.id,
-                stack
-                    .pointer("/stack/composeENV")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            ) {
+            Some(yaml) => match crate::ownership::audit(yaml, &args.id.id, env) {
                 Ok(c) => json!({ "complete": c.is_complete(), "unlabeled": c }),
                 Err(e) => json!({ "error": format!("{e:#}") }),
             },
@@ -198,15 +199,22 @@ impl DockgeUnitProvider {
 
     /// The compose actually sent to dockge for `p`: bind propagation forced
     /// and ownership labels merged in.
-    fn prepare(p: &StackDeployPayload, previous: Previous<'_>) -> Result<Labeled> {
+    fn prepare(
+        p: &StackDeployPayload,
+        previous: Previous<'_>,
+        global: Result<&str, &str>,
+    ) -> Result<Labeled> {
         // Force `rslave` propagation on bind mounts so a host CIFS/NFS remount
         // propagates INTO the container (orca #402 Part B). Never block a
         // deploy on this transform — fall back to the original YAML.
         let (compose_yaml, mut notes) =
             crate::compose_mounts::ensure_bind_propagation(&p.compose_yaml)
                 .unwrap_or_else(|_| (p.compose_yaml.clone(), Vec::new()));
-        let mut labeled =
-            crate::ownership::label(&compose_yaml, &p.name, previous, &p.compose_env)?;
+        let env = EnvFiles {
+            global,
+            stack: &p.compose_env,
+        };
+        let mut labeled = crate::ownership::label(&compose_yaml, &p.name, previous, env)?;
         notes.append(&mut labeled.notes);
         labeled.notes = notes;
         Ok(labeled)
@@ -232,7 +240,8 @@ impl DockgeUnitProvider {
         is_add: bool,
         previous: Previous<'_>,
     ) -> Result<VerbOutcome> {
-        let labeled = Self::prepare(&p, previous)?;
+        let global = client.global_env().await.map_err(|e| format!("{e:#}"));
+        let labeled = Self::prepare(&p, previous, global.as_deref().map_err(String::as_str))?;
         let body = if p.execute {
             let ack = client
                 .deploy_stack(&p.name, &labeled.yaml, &p.compose_env, is_add)
@@ -298,14 +307,20 @@ impl DockgeUnitProvider {
         if !exists {
             return Self::deploy(&client, p, true, Previous::New).await;
         }
-        let current = client.get_stack(&p.name).await.ok().and_then(|s| {
-            s.pointer("/stack/composeYAML")
+        let current = client.get_stack(&p.name).await.ok();
+        let field = |k: &str| {
+            current
+                .as_ref()
+                .and_then(|s| s.pointer(&format!("/stack/{k}")))
                 .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        let previous = current
-            .as_deref()
-            .map_or(Previous::Unknown, Previous::Compose);
+        };
+        let previous = match field("composeYAML") {
+            Some(yaml) => Previous::Compose {
+                yaml,
+                env: field("composeENV").unwrap_or_default(),
+            },
+            None => Previous::Unknown,
+        };
         Self::deploy(&client, p, false, previous).await
     }
 }
@@ -425,7 +440,7 @@ mod tests {
     fn prepare_labels_and_forces_bind_propagation() {
         let p =
             payload("services:\n  app:\n    image: x\n    volumes:\n      - /srv/media:/data\n");
-        let l = DockgeUnitProvider::prepare(&p, Previous::New).unwrap();
+        let l = DockgeUnitProvider::prepare(&p, Previous::New, Ok("")).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&l.yaml).unwrap();
         let app = &v["services"]["app"];
         assert_eq!(app["volumes"][0]["bind"]["propagation"], "rslave");
@@ -440,7 +455,7 @@ mod tests {
         let p = payload(
             "services:\n  app:\n    image: x\n    volumes:\n      - data:/data\nvolumes:\n  data:\n",
         );
-        let l = DockgeUnitProvider::prepare(&p, Previous::New).unwrap();
+        let l = DockgeUnitProvider::prepare(&p, Previous::New, Ok("")).unwrap();
         let notes = DockgeUnitProvider::dry_run_notes(&l);
         for r in ["volume 'data'", "network 'default'"] {
             assert!(
@@ -450,7 +465,15 @@ mod tests {
                 "{notes:?}"
             );
         }
-        let l = DockgeUnitProvider::prepare(&p, Previous::Compose(&p.compose_yaml)).unwrap();
+        let l = DockgeUnitProvider::prepare(
+            &p,
+            Previous::Compose {
+                yaml: &p.compose_yaml,
+                env: "",
+            },
+            Ok(""),
+        )
+        .unwrap();
         assert!(l.assumed_new.is_empty(), "{:?}", l.assumed_new);
     }
 
@@ -458,9 +481,36 @@ mod tests {
     fn prepare_takes_the_project_from_compose_env() {
         let mut p = payload("name: other\nservices:\n  app:\n    image: x\n");
         p.compose_env = "TZ=UTC\nCOMPOSE_PROJECT_NAME=tv\n".into();
-        let l = DockgeUnitProvider::prepare(&p, Previous::New).unwrap();
+        let l = DockgeUnitProvider::prepare(&p, Previous::New, Ok("")).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&l.yaml).unwrap();
         assert_eq!(v["services"]["app"]["labels"][crate::labels::STACK], "tv");
+    }
+
+    #[test]
+    fn stack_env_beats_global_env_and_an_unread_global_env_labels_nothing() {
+        let mut p = payload("services:\n  app:\n    image: x\n");
+        let stack_of = |l: &Labeled| -> serde_yaml::Value {
+            let v: serde_yaml::Value = serde_yaml::from_str(&l.yaml).unwrap();
+            v["services"]["app"]["labels"][crate::labels::STACK].clone()
+        };
+        let global = Ok("COMPOSE_PROJECT_NAME=films\n");
+        let l = DockgeUnitProvider::prepare(&p, Previous::New, global).unwrap();
+        assert_eq!(stack_of(&l), "films");
+        p.compose_env = "COMPOSE_PROJECT_NAME=tv\n".into();
+        let l = DockgeUnitProvider::prepare(&p, Previous::New, global).unwrap();
+        assert_eq!(stack_of(&l), "tv");
+
+        p.compose_env.clear();
+        let l = DockgeUnitProvider::prepare(&p, Previous::New, Err("timed out")).unwrap();
+        assert_eq!(l.yaml, p.compose_yaml);
+        assert_eq!(l.unlabeled, ["service 'app'", "network 'default'"]);
+        assert!(
+            l.notes
+                .iter()
+                .any(|n| n.contains("global.env could not be read") && n.contains("timed out")),
+            "{:?}",
+            l.notes
+        );
     }
 
     #[test]

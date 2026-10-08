@@ -48,6 +48,12 @@ async fn lists_stacks_against_live_dockge() {
         eprintln!("  - {name}: {meta}");
     }
 
+    let global = client
+        .global_env()
+        .await
+        .expect("global_env against live dockge");
+    eprintln!("live dockge global.env: {} line(s)", global.lines().count());
+
     // Full lifecycle proof (opt-in via DOCKGE_TEST_LIFECYCLE): deploy a
     // throwaway stack dockge fully owns, read it back, restart it (MANAGE),
     // then tear it down + delete it (cleanup). Uses a trivial `alpine` sleeper.
