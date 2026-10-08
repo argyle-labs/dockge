@@ -22,9 +22,12 @@
 #![allow(clippy::disallowed_types)]
 
 pub mod compose_mounts;
+pub mod labels;
+pub mod ownership;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
+pub mod yaml_text;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -159,17 +162,14 @@ impl Client {
         let session = self.session(Some(slot.clone())).await?;
         // Agent-wrapped request; dockge replies by pushing the `stackList`
         // agent frame (no ack), which the session handler captures.
-        session
+        let sent = session
             .emit_args("agent", agent_args("requestStackList", &[]))
-            .await
-            .ok();
-        let payload = wait_for_slot(&slot).await.unwrap_or_else(|| json!({}));
+            .await;
+        let payload = wait_for_slot(&slot).await;
         session.disconnect().await.ok();
-        // payload = `{ ok, stackList: { name: {…} }, endpoint }`.
-        Ok(payload
-            .get("stackList")
-            .cloned()
-            .unwrap_or_else(|| json!({})))
+        sent.context("request dockge stack list")?;
+        let payload = payload.context("dockge sent no stack list")?;
+        stack_list(&payload)
     }
 
     /// One stack's detail (`{ name, composeYAML, composeENV, status, … }`).
@@ -223,6 +223,17 @@ impl Client {
         ack
     }
 
+    /// The stacks directory's `global.env`, which dockge passes to every
+    /// compose run before the stack's `.env`; empty when there is none.
+    pub async fn global_env(&self) -> Result<String> {
+        let session = self.session(None).await?;
+        let ack = session
+            .emit_ack_args("getSettings", Vec::new(), ACK_TIMEOUT)
+            .await;
+        session.disconnect().await.ok();
+        global_env(&ack.context("dockge getSettings")?)
+    }
+
     /// Create + deploy a stack (dockge `deployStack`: `docker compose up -d`).
     /// `is_add` = true for a new stack. Deploying pulls images + starts
     /// containers, so this uses a longer timeout than the ack ops.
@@ -257,12 +268,41 @@ impl Client {
     }
 }
 
+/// What dockge's `getSettings` reports as `globalENV` when there is no
+/// `global.env`.
+const GLOBAL_ENV_PLACEHOLDER: &str = "# VARIABLE=value #comment";
+
+/// The stacks directory's `global.env` from a `getSettings` ack; empty when
+/// dockge has none.
+fn global_env(ack: &Value) -> Result<String> {
+    if !ack_ok(ack) {
+        bail!("dockge refused getSettings: {}", ack_msg(ack));
+    }
+    match ack.pointer("/data/globalENV").and_then(Value::as_str) {
+        Some(GLOBAL_ENV_PLACEHOLDER) => Ok(String::new()),
+        Some(env) => Ok(env.to_string()),
+        None => bail!("dockge settings have no globalENV"),
+    }
+}
+
+/// The stacks in a `stackList` push, `{ ok, stackList: { name: {…} }, endpoint }`.
+/// A refused or malformed list is an error, never an empty one.
+fn stack_list(payload: &Value) -> Result<Value> {
+    if payload.get("ok").and_then(Value::as_bool) == Some(false) {
+        bail!("dockge refused the stack list: {}", ack_msg(payload));
+    }
+    match payload.get("stackList") {
+        Some(list) if list.is_object() => Ok(list.clone()),
+        _ => bail!("dockge stack list has no stackList object"),
+    }
+}
+
 /// A dockge ack is `{ ok: bool, msg?: string, … }`.
-fn ack_ok(ack: &Value) -> bool {
+pub(crate) fn ack_ok(ack: &Value) -> bool {
     ack.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn ack_msg(ack: &Value) -> String {
+pub(crate) fn ack_msg(ack: &Value) -> String {
     ack.get("msg")
         .and_then(Value::as_str)
         .unwrap_or("no message")
@@ -297,6 +337,26 @@ mod tests {
     fn ack_msg_falls_back() {
         assert_eq!(ack_msg(&json!({ "msg": "bad login" })), "bad login");
         assert_eq!(ack_msg(&json!({})), "no message");
+    }
+
+    #[test]
+    fn stack_list_rejects_refused_or_malformed_payloads() {
+        let ok = json!({ "ok": true, "stackList": { "media": {} } });
+        assert!(stack_list(&ok).unwrap().get("media").is_some());
+        assert!(stack_list(&json!({ "ok": false, "msg": "no" })).is_err());
+        assert!(stack_list(&json!({ "ok": true })).is_err());
+    }
+
+    #[test]
+    fn global_env_skips_the_placeholder_and_rejects_refusals() {
+        let ack = |env: &str| json!({ "ok": true, "data": { "globalENV": env } });
+        assert_eq!(
+            global_env(&ack("COMPOSE_PROJECT_NAME=tv\n")).unwrap(),
+            "COMPOSE_PROJECT_NAME=tv\n"
+        );
+        assert_eq!(global_env(&ack(GLOBAL_ENV_PLACEHOLDER)).unwrap(), "");
+        assert!(global_env(&json!({ "ok": false, "msg": "not logged in" })).is_err());
+        assert!(global_env(&json!({ "ok": true, "data": {} })).is_err());
     }
 
     #[test]
