@@ -37,6 +37,9 @@ use plugin_toolkit::serde_json::{Value, json};
 use plugin_toolkit::socketio::{PushHandler, SocketConfig, SocketSession};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
+/// Dockge builds the stack list with `docker compose ls`, slow on a busy
+/// host.
+const STACK_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Deploying pulls images + starts containers — allow much longer than a
 /// plain ack.
@@ -155,36 +158,61 @@ impl Client {
             socket.disconnect().await.ok();
             bail!("dockge login rejected: {}", ack_msg(&ack));
         }
-        Ok(Session { socket, stacklist })
+        Ok(Session {
+            socket: Some(socket),
+            stacklist,
+        })
     }
 }
 
-/// One authenticated connection to a dockge instance.
+/// One authenticated connection to a dockge instance. Dropped without
+/// [`Session::close`] (a cancelled or panicking verb), it disconnects in the
+/// background: the transport reconnects on its own, so a leaked session
+/// would keep logging back in.
 pub struct Session {
-    socket: SocketSession,
+    socket: Option<SocketSession>,
     stacklist: Arc<Mutex<Option<Value>>>,
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(socket) = self.socket.take() {
+            plugin_toolkit::reactor::spawn_detached(async move {
+                socket.disconnect().await.ok();
+            });
+        }
+    }
+}
+
 impl Session {
-    pub async fn close(self) {
-        self.socket.disconnect().await.ok();
+    pub async fn close(mut self) {
+        if let Some(socket) = self.socket.take() {
+            socket.disconnect().await.ok();
+        }
+    }
+
+    fn socket(&self) -> Result<&SocketSession> {
+        self.socket.as_ref().context("dockge session is closed")
     }
 
     /// All stacks on this instance, as dockge's `stackList` map
     /// (`{ name: { status, tags, … } }`).
     pub async fn list_stacks(&self) -> Result<Value> {
-        // Drop a list pushed earlier on this session (on login or after a
-        // change) so the reply to this request is what gets read.
+        // Dockge acks the agent-wrapped request, then pushes the list as a
+        // `stackList` agent frame once `docker compose ls` returns; anything
+        // already captured is from before this request.
+        let ack = self
+            .socket()?
+            .emit_ack_args("agent", agent_args("requestStackList", &[]), ACK_TIMEOUT)
+            .await
+            .context("request dockge stack list")?;
+        if !ack_ok(&ack) {
+            bail!("dockge refused the stack list request: {}", ack_msg(&ack));
+        }
         if let Ok(mut g) = self.stacklist.lock() {
             g.take();
         }
-        // Agent-wrapped request; dockge replies by pushing the `stackList`
-        // agent frame (no ack), which the session handler captures.
-        self.socket
-            .emit_args("agent", agent_args("requestStackList", &[]))
-            .await
-            .context("request dockge stack list")?;
-        let payload = wait_for_slot(&self.stacklist)
+        let payload = wait_for_slot(&self.stacklist, STACK_LIST_TIMEOUT)
             .await
             .context("dockge sent no stack list")?;
         stack_list(&payload)
@@ -195,7 +223,7 @@ impl Session {
         if name.is_empty() {
             bail!("missing stack name");
         }
-        self.socket
+        self.socket()?
             .emit_ack_args("agent", agent_args("getStack", &[json!(name)]), ACK_TIMEOUT)
             .await
     }
@@ -213,7 +241,7 @@ impl Session {
         };
         // Lifecycle actions shell out to `docker compose` (start/stop/pull) and
         // can take far longer than a plain ack, so allow the deploy timeout.
-        self.socket
+        self.socket()?
             .emit_ack_args("agent", agent_args(&event, &[json!(name)]), DEPLOY_TIMEOUT)
             .await
     }
@@ -223,7 +251,7 @@ impl Session {
         if name.is_empty() {
             bail!("missing stack name");
         }
-        self.socket
+        self.socket()?
             .emit_ack_args(
                 "agent",
                 agent_args("deleteStack", &[json!(name)]),
@@ -236,7 +264,7 @@ impl Session {
     /// compose run before the stack's `.env`; empty when there is none.
     pub async fn global_env(&self) -> Result<String> {
         let ack = self
-            .socket
+            .socket()?
             .emit_ack_args("getSettings", Vec::new(), ACK_TIMEOUT)
             .await
             .context("dockge getSettings")?;
@@ -256,7 +284,7 @@ impl Session {
         if name.is_empty() {
             bail!("missing stack name");
         }
-        self.socket
+        self.socket()?
             .emit_ack_args(
                 "agent",
                 agent_args(
@@ -315,17 +343,20 @@ pub(crate) fn ack_msg(ack: &Value) -> String {
         .to_string()
 }
 
-/// Poll a capture slot for a pushed payload, up to ~2s.
-async fn wait_for_slot(slot: &Arc<Mutex<Option<Value>>>) -> Option<Value> {
-    for _ in 0..20 {
+/// Poll a capture slot for a pushed payload until `limit` passes.
+async fn wait_for_slot(slot: &Arc<Mutex<Option<Value>>>, limit: Duration) -> Option<Value> {
+    let deadline = plugin_toolkit::time::Deadline::after(limit);
+    loop {
         if let Ok(mut g) = slot.lock()
             && let Some(v) = g.take()
         {
             return Some(v);
         }
+        if deadline.reached() {
+            return None;
+        }
         plugin_toolkit::time::sleep(Duration::from_millis(100)).await;
     }
-    None
 }
 
 #[cfg(test)]
@@ -363,6 +394,24 @@ mod tests {
         assert_eq!(global_env(&ack(GLOBAL_ENV_PLACEHOLDER)).unwrap(), "");
         assert!(global_env(&json!({ "ok": false, "msg": "not logged in" })).is_err());
         assert!(global_env(&json!({ "ok": true, "data": {} })).is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_for_slot_takes_a_late_push_and_gives_up_at_the_limit() {
+        let slot = Arc::new(Mutex::new(None));
+        let pusher = slot.clone();
+        let push = tokio::spawn(async move {
+            plugin_toolkit::time::sleep(Duration::from_millis(250)).await;
+            *pusher.lock().unwrap() = Some(json!({ "ok": true }));
+        });
+        let got = wait_for_slot(&slot, Duration::from_secs(5)).await;
+        push.await.unwrap();
+        assert_eq!(got, Some(json!({ "ok": true })));
+        assert!(slot.lock().unwrap().is_none());
+
+        let start = std::time::Instant::now();
+        assert_eq!(wait_for_slot(&slot, Duration::from_millis(300)).await, None);
+        assert!(start.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]
