@@ -195,9 +195,13 @@ impl DockgeUnitProvider {
         // Force `rslave` propagation on bind mounts so a host CIFS/NFS remount
         // propagates INTO the container (orca #402 Part B). Never block a
         // deploy on this transform — fall back to the original YAML.
-        let compose_yaml = crate::compose_mounts::ensure_bind_propagation(&p.compose_yaml)
-            .unwrap_or_else(|_| p.compose_yaml.clone());
-        crate::ownership::label(&compose_yaml, &p.name, previous)
+        let (compose_yaml, mut notes) =
+            crate::compose_mounts::ensure_bind_propagation(&p.compose_yaml)
+                .unwrap_or_else(|_| (p.compose_yaml.clone(), Vec::new()));
+        let mut labeled = crate::ownership::label(&compose_yaml, &p.name, previous)?;
+        notes.append(&mut labeled.notes);
+        labeled.notes = notes;
+        Ok(labeled)
     }
 
     /// Deploy a stack. `is_add` = true creates a fresh stack (dockge errors if it
@@ -267,10 +271,9 @@ impl DockgeUnitProvider {
         let client = make_client(&p.endpoint)?;
         let exists = client
             .list_stacks()
-            .await
-            .ok()
-            .and_then(|v| v.as_object().map(|o| o.contains_key(&p.name)))
-            .unwrap_or(false);
+            .await?
+            .as_object()
+            .is_some_and(|o| o.contains_key(&p.name));
         if !exists {
             return Self::deploy(&client, p, true, Previous::New).await;
         }

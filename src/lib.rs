@@ -27,6 +27,7 @@ pub mod ownership;
 pub mod tools;
 pub mod topology;
 pub mod unit_provider;
+pub mod yaml_text;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -161,17 +162,14 @@ impl Client {
         let session = self.session(Some(slot.clone())).await?;
         // Agent-wrapped request; dockge replies by pushing the `stackList`
         // agent frame (no ack), which the session handler captures.
-        session
+        let sent = session
             .emit_args("agent", agent_args("requestStackList", &[]))
-            .await
-            .ok();
-        let payload = wait_for_slot(&slot).await.unwrap_or_else(|| json!({}));
+            .await;
+        let payload = wait_for_slot(&slot).await;
         session.disconnect().await.ok();
-        // payload = `{ ok, stackList: { name: {…} }, endpoint }`.
-        Ok(payload
-            .get("stackList")
-            .cloned()
-            .unwrap_or_else(|| json!({})))
+        sent.context("request dockge stack list")?;
+        let payload = payload.context("dockge sent no stack list")?;
+        stack_list(&payload)
     }
 
     /// One stack's detail (`{ name, composeYAML, composeENV, status, … }`).
@@ -259,6 +257,18 @@ impl Client {
     }
 }
 
+/// The stacks in a `stackList` push, `{ ok, stackList: { name: {…} }, endpoint }`.
+/// A refused or malformed list is an error, never an empty one.
+fn stack_list(payload: &Value) -> Result<Value> {
+    if payload.get("ok").and_then(Value::as_bool) == Some(false) {
+        bail!("dockge refused the stack list: {}", ack_msg(payload));
+    }
+    match payload.get("stackList") {
+        Some(list) if list.is_object() => Ok(list.clone()),
+        _ => bail!("dockge stack list has no stackList object"),
+    }
+}
+
 /// A dockge ack is `{ ok: bool, msg?: string, … }`.
 pub(crate) fn ack_ok(ack: &Value) -> bool {
     ack.get("ok").and_then(Value::as_bool).unwrap_or(false)
@@ -299,6 +309,14 @@ mod tests {
     fn ack_msg_falls_back() {
         assert_eq!(ack_msg(&json!({ "msg": "bad login" })), "bad login");
         assert_eq!(ack_msg(&json!({})), "no message");
+    }
+
+    #[test]
+    fn stack_list_rejects_refused_or_malformed_payloads() {
+        let ok = json!({ "ok": true, "stackList": { "media": {} } });
+        assert!(stack_list(&ok).unwrap().get("media").is_some());
+        assert!(stack_list(&json!({ "ok": false, "msg": "no" })).is_err());
+        assert!(stack_list(&json!({ "ok": true })).is_err());
     }
 
     #[test]
