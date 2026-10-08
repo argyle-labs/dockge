@@ -30,7 +30,7 @@ use plugin_toolkit::schemars::{JsonSchema, schema_for};
 use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, Value, json};
 
-use crate::Client;
+use crate::Session;
 use crate::ownership::{EnvFiles, Labeled, Previous};
 use crate::tools::{enabled_endpoints, make_client};
 
@@ -62,6 +62,44 @@ pub struct StackDeployPayload {
 /// Lifecycle actions accepted on `Verb::Update` — each maps to dockge's
 /// single-arg `<op>Stack` event.
 const ACTIONS: &[&str] = &["start", "stop", "restart", "down", "update"];
+
+/// The requests a deploy or detail makes, all on one dockge [`Session`].
+pub(crate) trait Stacks {
+    async fn list_stacks(&self) -> Result<Value>;
+    async fn get_stack(&self, name: &str) -> Result<Value>;
+    async fn global_env(&self) -> Result<String>;
+    async fn deploy_stack(
+        &self,
+        name: &str,
+        compose_yaml: &str,
+        compose_env: &str,
+        is_add: bool,
+    ) -> Result<Value>;
+}
+
+impl Stacks for Session {
+    async fn list_stacks(&self) -> Result<Value> {
+        Session::list_stacks(self).await
+    }
+
+    async fn get_stack(&self, name: &str) -> Result<Value> {
+        Session::get_stack(self, name).await
+    }
+
+    async fn global_env(&self) -> Result<String> {
+        Session::global_env(self).await
+    }
+
+    async fn deploy_stack(
+        &self,
+        name: &str,
+        compose_yaml: &str,
+        compose_env: &str,
+        is_add: bool,
+    ) -> Result<Value> {
+        Session::deploy_stack(self, name, compose_yaml, compose_env, is_add).await
+    }
+}
 
 #[derive(Default)]
 pub struct DockgeUnitProvider;
@@ -100,7 +138,15 @@ impl DockgeUnitProvider {
                     continue;
                 }
             };
-            match client.list_stacks().await {
+            let listed = match client.connect().await {
+                Ok(session) => {
+                    let list = session.list_stacks().await;
+                    session.close().await;
+                    list
+                }
+                Err(e) => Err(e),
+            };
+            match listed {
                 Ok(list) => {
                     if let Some(obj) = list.as_object() {
                         for (name, meta) in obj {
@@ -141,9 +187,15 @@ impl DockgeUnitProvider {
 
     async fn do_detail(&self, args: DetailArgs) -> Result<VerbOutcome> {
         let ep = Self::endpoint_of(&args.id.manager).to_string();
-        let client = make_client(&ep)?;
-        let mut stack = client.get_stack(&args.id.id).await?;
-        let global = client.global_env().await.map_err(|e| format!("{e:#}"));
+        let session = make_client(&ep)?.connect().await?;
+        let out = Self::detail(&session, args).await;
+        session.close().await;
+        out
+    }
+
+    async fn detail(s: &impl Stacks, args: DetailArgs) -> Result<VerbOutcome> {
+        let mut stack = s.get_stack(&args.id.id).await?;
+        let global = s.global_env().await.map_err(|e| format!("{e:#}"));
         let env = EnvFiles {
             global: global.as_deref().map_err(String::as_str),
             stack: stack
@@ -173,8 +225,10 @@ impl DockgeUnitProvider {
         if !ACTIONS.contains(&op) {
             return Err(anyhow::anyhow!("unknown stack update action: {op}"));
         }
-        let client = make_client(&ep)?;
-        client.stack_action(&args.id.id, op).await?;
+        let session = make_client(&ep)?.connect().await?;
+        let acted = session.stack_action(&args.id.id, op).await;
+        session.close().await;
+        acted?;
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!("{op} {} on {ep}", args.id.id),
@@ -183,8 +237,10 @@ impl DockgeUnitProvider {
 
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
         let ep = Self::endpoint_of(&args.id.manager).to_string();
-        let client = make_client(&ep)?;
-        client.delete_stack(&args.id.id).await?;
+        let session = make_client(&ep)?.connect().await?;
+        let deleted = session.delete_stack(&args.id.id).await;
+        session.close().await;
+        deleted?;
         Ok(VerbOutcome::Action(ActionOutcome {
             changed: true,
             message: format!("deleted {} on {ep}", args.id.id),
@@ -235,15 +291,15 @@ impl DockgeUnitProvider {
     /// already exists); false updates an existing one. A dry run unless
     /// `p.execute`.
     async fn deploy(
-        client: &Client,
+        s: &impl Stacks,
         p: StackDeployPayload,
         is_add: bool,
         previous: Previous<'_>,
     ) -> Result<VerbOutcome> {
-        let global = client.global_env().await.map_err(|e| format!("{e:#}"));
+        let global = s.global_env().await.map_err(|e| format!("{e:#}"));
         let labeled = Self::prepare(&p, previous, global.as_deref().map_err(String::as_str))?;
         let body = if p.execute {
-            let ack = client
+            let ack = s
                 .deploy_stack(&p.name, &labeled.yaml, &p.compose_env, is_add)
                 .await?;
             if !crate::ack_ok(&ack) {
@@ -289,25 +345,33 @@ impl DockgeUnitProvider {
             ));
         }
         let p = Self::parse_deploy_payload(args.payload)?;
-        let client = make_client(&p.endpoint)?;
+        let session = make_client(&p.endpoint)?.connect().await?;
         // Create is add-only: dockge rejects deploying over an existing stack.
-        Self::deploy(&client, p, true, Previous::New).await
+        let out = Self::deploy(&session, p, true, Previous::New).await;
+        session.close().await;
+        out
     }
 
     /// Idempotent create-or-update: add the stack if absent on the endpoint,
     /// otherwise redeploy over the existing one.
     async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
         let p = Self::parse_deploy_payload(args.payload)?;
-        let client = make_client(&p.endpoint)?;
-        let exists = client
+        let session = make_client(&p.endpoint)?.connect().await?;
+        let out = Self::upsert(&session, p).await;
+        session.close().await;
+        out
+    }
+
+    async fn upsert(s: &impl Stacks, p: StackDeployPayload) -> Result<VerbOutcome> {
+        let exists = s
             .list_stacks()
             .await?
             .as_object()
             .is_some_and(|o| o.contains_key(&p.name));
         if !exists {
-            return Self::deploy(&client, p, true, Previous::New).await;
+            return Self::deploy(s, p, true, Previous::New).await;
         }
-        let current = client.get_stack(&p.name).await.ok();
+        let current = s.get_stack(&p.name).await.ok();
         let field = |k: &str| {
             current
                 .as_ref()
@@ -321,7 +385,7 @@ impl DockgeUnitProvider {
             },
             None => Previous::Unknown,
         };
-        Self::deploy(&client, p, false, previous).await
+        Self::deploy(s, p, false, previous).await
     }
 }
 
@@ -511,6 +575,109 @@ mod tests {
             "{:?}",
             l.notes
         );
+    }
+
+    /// Records every request so a test can see what one verb sent over its
+    /// one session.
+    #[derive(Default)]
+    struct Recorder {
+        stacks: Value,
+        stack: Value,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Stacks for Recorder {
+        async fn list_stacks(&self) -> Result<Value> {
+            self.log("list".into());
+            Ok(self.stacks.clone())
+        }
+
+        async fn get_stack(&self, name: &str) -> Result<Value> {
+            self.log(format!("get {name}"));
+            Ok(self.stack.clone())
+        }
+
+        async fn global_env(&self) -> Result<String> {
+            self.log("getSettings".into());
+            Ok(String::new())
+        }
+
+        async fn deploy_stack(
+            &self,
+            name: &str,
+            _compose_yaml: &str,
+            _compose_env: &str,
+            is_add: bool,
+        ) -> Result<Value> {
+            self.log(format!("deploy {name} add={is_add}"));
+            Ok(json!({ "ok": true }))
+        }
+    }
+
+    const COMPOSE: &str = "services:\n  app:\n    image: x\n";
+
+    #[tokio::test]
+    async fn upsert_of_an_existing_stack_runs_on_one_session() {
+        let s = Recorder {
+            stacks: json!({ "media": {} }),
+            stack: json!({ "stack": { "composeYAML": COMPOSE, "composeENV": "" } }),
+            ..Recorder::default()
+        };
+        let mut p = payload(COMPOSE);
+        p.execute = true;
+        DockgeUnitProvider::upsert(&s, p).await.unwrap();
+        assert_eq!(
+            s.calls(),
+            ["list", "get media", "getSettings", "deploy media add=false"]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_of_a_new_stack_adds_it_on_one_session() {
+        let s = Recorder {
+            stacks: json!({}),
+            ..Recorder::default()
+        };
+        let mut p = payload(COMPOSE);
+        p.execute = true;
+        DockgeUnitProvider::upsert(&s, p).await.unwrap();
+        assert_eq!(s.calls(), ["list", "getSettings", "deploy media add=true"]);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_deploy_never_sends_the_compose() {
+        let s = Recorder::default();
+        DockgeUnitProvider::deploy(&s, payload(COMPOSE), true, Previous::New)
+            .await
+            .unwrap();
+        assert_eq!(s.calls(), ["getSettings"]);
+    }
+
+    #[tokio::test]
+    async fn detail_reads_the_stack_and_settings_on_one_session() {
+        let s = Recorder {
+            stack: json!({ "stack": { "composeYAML": COMPOSE, "composeENV": "" } }),
+            ..Recorder::default()
+        };
+        let args = DetailArgs {
+            id: DockgeUnitProvider::unit_id("baldur", "media"),
+            query: Default::default(),
+        };
+        let VerbOutcome::Item(item) = DockgeUnitProvider::detail(&s, args).await.unwrap() else {
+            panic!("detail returns an item");
+        };
+        assert_eq!(s.calls(), ["get media", "getSettings"]);
+        assert!(item.payload.contains("\"ownership\""), "{}", item.payload);
     }
 
     #[test]

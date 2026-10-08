@@ -90,9 +90,8 @@ impl Config {
     }
 }
 
-/// A dockge client. Each call opens a short-lived authenticated Socket.IO
-/// session (Socket.IO auth is per-connection); a shared session cache is a
-/// future toolkit optimisation, not required for correctness.
+/// A dockge instance. [`Client::connect`] opens an authenticated
+/// [`Session`]; callers run all of one operation's requests on it.
 #[derive(Clone)]
 pub struct Client {
     cfg: Config,
@@ -103,31 +102,28 @@ impl Client {
         Self { cfg }
     }
 
-    /// Connect and authenticate. `stacklist_slot`, if set, captures dockge's
-    /// pushed `stackList` (streamed on connect + on change) out of the `agent`
-    /// frame it arrives in.
-    async fn session(
-        &self,
-        stacklist_slot: Option<Arc<Mutex<Option<Value>>>>,
-    ) -> Result<SocketSession> {
-        let mut handlers: Vec<(String, PushHandler)> = Vec::new();
-        if let Some(slot) = stacklist_slot {
-            handlers.push((
-                "agent".to_string(),
-                Arc::new(move |v: Value| {
-                    // Server → client agent frame: `["stackList", { ok,
-                    // stackList, endpoint }]`. Capture the data object.
-                    if let Some(arr) = v.as_array()
-                        && arr.first().and_then(Value::as_str) == Some("stackList")
-                        && let Ok(mut g) = slot.lock()
-                    {
-                        *g = Some(arr.get(1).cloned().unwrap_or(Value::Null));
-                    }
-                }) as PushHandler,
-            ));
-        }
+    /// Connect and log in. Every login runs dockge's afterLogin (a
+    /// `docker compose ls` and a connection to each agent) and counts against
+    /// its shared login rate limit (20 a minute), so open one session per
+    /// operation, not one per request.
+    pub async fn connect(&self) -> Result<Session> {
+        let stacklist: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let slot = stacklist.clone();
+        let handlers: Vec<(String, PushHandler)> = vec![(
+            "agent".to_string(),
+            Arc::new(move |v: Value| {
+                // Server → client agent frame: `["stackList", { ok,
+                // stackList, endpoint }]`. Capture the data object.
+                if let Some(arr) = v.as_array()
+                    && arr.first().and_then(Value::as_str) == Some("stackList")
+                    && let Ok(mut g) = slot.lock()
+                {
+                    *g = Some(arr.get(1).cloned().unwrap_or(Value::Null));
+                }
+            }) as PushHandler,
+        )];
 
-        let session = SocketSession::connect_with(
+        let socket = SocketSession::connect_with(
             SocketConfig::new(&self.cfg.base_url)
                 .insecure(self.cfg.insecure)
                 .connect_timeout(CONNECT_TIMEOUT),
@@ -137,7 +133,7 @@ impl Client {
         .with_context(|| format!("connect dockge at {}", self.cfg.base_url))?;
 
         // Dockge login: username/password (+ empty 2FA token) → JWT in the ack.
-        let ack = session
+        let ack = socket
             .emit_ack(
                 "login",
                 json!({
@@ -147,28 +143,50 @@ impl Client {
                 }),
                 ACK_TIMEOUT,
             )
-            .await
-            .context("dockge login")?;
+            .await;
+        let ack = match ack {
+            Ok(a) => a,
+            Err(e) => {
+                socket.disconnect().await.ok();
+                return Err(e.context("dockge login"));
+            }
+        };
         if !ack_ok(&ack) {
+            socket.disconnect().await.ok();
             bail!("dockge login rejected: {}", ack_msg(&ack));
         }
-        Ok(session)
+        Ok(Session { socket, stacklist })
+    }
+}
+
+/// One authenticated connection to a dockge instance.
+pub struct Session {
+    socket: SocketSession,
+    stacklist: Arc<Mutex<Option<Value>>>,
+}
+
+impl Session {
+    pub async fn close(self) {
+        self.socket.disconnect().await.ok();
     }
 
     /// All stacks on this instance, as dockge's `stackList` map
     /// (`{ name: { status, tags, … } }`).
     pub async fn list_stacks(&self) -> Result<Value> {
-        let slot = Arc::new(Mutex::new(None));
-        let session = self.session(Some(slot.clone())).await?;
+        // Drop a list pushed earlier on this session (on login or after a
+        // change) so the reply to this request is what gets read.
+        if let Ok(mut g) = self.stacklist.lock() {
+            g.take();
+        }
         // Agent-wrapped request; dockge replies by pushing the `stackList`
         // agent frame (no ack), which the session handler captures.
-        let sent = session
+        self.socket
             .emit_args("agent", agent_args("requestStackList", &[]))
-            .await;
-        let payload = wait_for_slot(&slot).await;
-        session.disconnect().await.ok();
-        sent.context("request dockge stack list")?;
-        let payload = payload.context("dockge sent no stack list")?;
+            .await
+            .context("request dockge stack list")?;
+        let payload = wait_for_slot(&self.stacklist)
+            .await
+            .context("dockge sent no stack list")?;
         stack_list(&payload)
     }
 
@@ -177,12 +195,9 @@ impl Client {
         if name.is_empty() {
             bail!("missing stack name");
         }
-        let session = self.session(None).await?;
-        let ack = session
+        self.socket
             .emit_ack_args("agent", agent_args("getStack", &[json!(name)]), ACK_TIMEOUT)
-            .await;
-        session.disconnect().await.ok();
-        ack
+            .await
     }
 
     /// Run a lifecycle action against a stack. `op` ∈
@@ -196,14 +211,11 @@ impl Client {
             "start" | "stop" | "restart" | "down" | "update" => format!("{op}Stack"),
             other => bail!("unknown stack action: {other}"),
         };
-        let session = self.session(None).await?;
         // Lifecycle actions shell out to `docker compose` (start/stop/pull) and
         // can take far longer than a plain ack, so allow the deploy timeout.
-        let ack = session
+        self.socket
             .emit_ack_args("agent", agent_args(&event, &[json!(name)]), DEPLOY_TIMEOUT)
-            .await;
-        session.disconnect().await.ok();
-        ack
+            .await
     }
 
     /// Remove a stack.
@@ -211,27 +223,24 @@ impl Client {
         if name.is_empty() {
             bail!("missing stack name");
         }
-        let session = self.session(None).await?;
-        let ack = session
+        self.socket
             .emit_ack_args(
                 "agent",
                 agent_args("deleteStack", &[json!(name)]),
                 ACK_TIMEOUT,
             )
-            .await;
-        session.disconnect().await.ok();
-        ack
+            .await
     }
 
     /// The stacks directory's `global.env`, which dockge passes to every
     /// compose run before the stack's `.env`; empty when there is none.
     pub async fn global_env(&self) -> Result<String> {
-        let session = self.session(None).await?;
-        let ack = session
+        let ack = self
+            .socket
             .emit_ack_args("getSettings", Vec::new(), ACK_TIMEOUT)
-            .await;
-        session.disconnect().await.ok();
-        global_env(&ack.context("dockge getSettings")?)
+            .await
+            .context("dockge getSettings")?;
+        global_env(&ack)
     }
 
     /// Create + deploy a stack (dockge `deployStack`: `docker compose up -d`).
@@ -247,8 +256,7 @@ impl Client {
         if name.is_empty() {
             bail!("missing stack name");
         }
-        let session = self.session(None).await?;
-        let ack = session
+        self.socket
             .emit_ack_args(
                 "agent",
                 agent_args(
@@ -262,9 +270,7 @@ impl Client {
                 ),
                 DEPLOY_TIMEOUT,
             )
-            .await;
-        session.disconnect().await.ok();
-        ack
+            .await
     }
 }
 

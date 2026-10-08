@@ -68,7 +68,15 @@ pub async fn collect_claims() -> Result<Vec<TopologyClaim>> {
         // resolved host lets inventory attribute stacks to the right node
         // regardless of which daemon collected them.
         let runs_on = runs_on_from_base_url(&row.base_url);
-        match client.list_stacks().await {
+        let listed = match client.connect().await {
+            Ok(session) => {
+                let list = session.list_stacks().await;
+                session.close().await;
+                list
+            }
+            Err(e) => Err(e),
+        };
+        match listed {
             Ok(list) => {
                 if let Some(obj) = list.as_object() {
                     for name in obj.keys() {
