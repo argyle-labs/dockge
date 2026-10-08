@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use plugin_toolkit::anyhow::{Context, Result, bail};
+use plugin_toolkit::anyhow::{Context, Result, anyhow, bail};
 use plugin_toolkit::serde::Serialize;
 use serde_yaml::{Mapping, Value};
 
@@ -72,7 +72,7 @@ pub struct Labeled {
     pub notes: Vec<String>,
     /// Resources left without orca's labels, e.g. `volume 'data'`.
     pub unlabeled: Vec<String>,
-    /// Volumes and networks of a new stack that carry orca's labels on the
+    /// Volumes and networks new to the stack that carry orca's labels on the
     /// assumption that the engine has none by that name yet.
     pub assumed_new: Vec<String>,
 }
@@ -151,12 +151,9 @@ fn is_external(entry: Option<&Value>) -> bool {
         .is_some_and(|x| !matches!(x, Value::Bool(false) | Value::Null))
 }
 
-fn is_managed(entry: Option<&Value>) -> bool {
-    labels::is_managed(label_map(entry.and_then(|e| e.get("labels"))).iter())
-}
-
-/// An explicitly named volume or network already carrying the labels this
-/// stack writes is one a previous deploy converted; it is left as written.
+/// Whether `entry` carries the labels this stack writes. An explicitly named
+/// volume or network that does is one a previous deploy converted; it is
+/// left as written.
 fn is_ours(entry: Option<&Value>, project: &str) -> bool {
     let have = label_map(entry.and_then(|e| e.get("labels")));
     labels::is_managed(have.iter())
@@ -563,12 +560,47 @@ fn resources(doc: &Value) -> Vec<String> {
         .map(|k| format!("service '{k}'"))
         .collect();
     out.extend(keys("volumes").into_iter().map(|k| format!("volume '{k}'")));
-    out.extend(
-        keys("networks")
-            .into_iter()
-            .map(|k| format!("network '{k}'")),
-    );
+    let mut networks: BTreeSet<String> = keys("networks").into_iter().collect();
+    if doc
+        .get("services")
+        .and_then(Value::as_mapping)
+        .is_some_and(|s| s.values().any(uses_default_network))
+    {
+        networks.insert("default".to_string());
+    }
+    out.extend(networks.into_iter().map(|k| format!("network '{k}'")));
     out
+}
+
+/// compose's normalization of a directory name into a project name.
+fn normalize_project(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .collect::<String>()
+        .trim_start_matches(['_', '-'])
+        .to_string()
+}
+
+/// The compose project of dockge stack `stack`. Dockge runs `docker compose`
+/// in `<stacks dir>/<stack>` without `-p`, so compose takes
+/// `COMPOSE_PROJECT_NAME` from the env file, then `name:`, then the
+/// normalized directory name. A value that is interpolated or not already a
+/// valid project name cannot be resolved here, and is refused.
+fn project_name(compose_env: &str, doc: &Value, stack: &str) -> Result<String, String> {
+    let explicit = env_project(compose_env)
+        .or_else(|| doc.get("name").and_then(Value::as_str).map(str::to_string));
+    match explicit {
+        Some(v) if v.contains('$') => Err(format!("project name {v:?} is interpolated")),
+        Some(v) if v.is_empty() || normalize_project(&v) != v => Err(format!(
+            "project name {v:?} is not a valid compose project name"
+        )),
+        Some(v) => Ok(v),
+        None => match normalize_project(stack) {
+            n if n.is_empty() => Err(format!("stack name {stack:?} normalizes to nothing")),
+            n => Ok(n),
+        },
+    }
 }
 
 /// Write orca's ownership labels into `compose_yaml` for dockge stack
@@ -606,14 +638,13 @@ pub fn label(
             return unchanged(notes, resources(&resolved));
         }
     };
-    let project = env_project(compose_env)
-        .or_else(|| {
-            resolved
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| stack.to_string());
+    let project = match project_name(compose_env, &resolved, stack) {
+        Ok(p) => p,
+        Err(why) => {
+            notes.push(format!("labels not applied: {why}"));
+            return unchanged(notes, resources(&resolved));
+        }
+    };
     let mut e = Editor {
         text,
         doc: original.clone(),
@@ -795,9 +826,6 @@ pub fn label(
         notes,
         unlabeled,
     } = e;
-    if !matches!(before, Before::New) {
-        assumed_new.clear();
-    }
     assumed_new.retain(|r| !unlabeled.contains(r));
     let yaml = if doc == original {
         compose_yaml.to_string()
@@ -812,12 +840,14 @@ pub fn label(
     })
 }
 
-/// What `compose_yaml` leaves without orca's labels.
-pub fn audit(compose_yaml: &str) -> Result<Coverage> {
+/// What dockge stack `stack`'s `compose_yaml` leaves without the labels
+/// [`label`] writes.
+pub fn audit(compose_yaml: &str, stack: &str, compose_env: &str) -> Result<Coverage> {
     let doc = merged(&parse(compose_yaml)?)?;
     if !doc.is_mapping() {
         bail!("compose is empty or not a YAML mapping");
     }
+    let project = project_name(compose_env, &doc, stack).map_err(|why| anyhow!(why))?;
     let mut out = Coverage {
         partial: !partial_notes(&doc).is_empty(),
         ..Coverage::default()
@@ -834,7 +864,7 @@ pub fn audit(compose_yaml: &str) -> Result<Coverage> {
             continue;
         };
         default_used |= uses_default_network(spec);
-        if !labels::is_managed(label_map(spec.get("labels")).iter()) {
+        if !is_ours(Some(spec), &project) {
             out.services.push(svc.to_string());
         }
         let entries = spec.get("volumes").and_then(Value::as_sequence);
@@ -858,7 +888,7 @@ pub fn audit(compose_yaml: &str) -> Result<Coverage> {
         keys.into_iter()
             .filter(|k| {
                 let entry = declared.and_then(|m| m.get(k.as_str()));
-                !is_external(entry) && !is_managed(entry)
+                !is_external(entry) && !is_ours(entry, &project)
             })
             .collect()
     };
@@ -997,7 +1027,7 @@ mod tests {
             "/var/lib/db"
         );
         assert!(
-            audit(&serde_yaml::to_string(&v).unwrap())
+            audit(&serde_yaml::to_string(&v).unwrap(), "media", "")
                 .unwrap()
                 .is_complete()
         );
@@ -1032,6 +1062,8 @@ mod tests {
         assert_eq!(v["volumes"]["data"]["labels"][STACK], "old");
         assert!(v["volumes"]["data"]["labels"].get(SERVICE).is_none());
         assert_eq!(v["volumes"]["logs"]["labels"][STACK], "media");
+        let l = label(new, "media", Previous::Compose(old), "").unwrap();
+        assert_eq!(l.assumed_new, ["volume 'logs'"]);
     }
 
     #[test]
@@ -1059,7 +1091,7 @@ mod tests {
     #[test]
     fn audit_reports_unlabeled_resources() {
         let yaml = "services:\n  app:\n    image: x\n    volumes:\n      - data:/data\n      - /cache\n      - ./conf:/conf\nnetworks:\n  proxy:\n    external: true\nvolumes:\n  data:\n";
-        let c = audit(yaml).unwrap();
+        let c = audit(yaml, "media", "").unwrap();
         assert_eq!(c.services, ["app"]);
         assert_eq!(c.networks, ["default"]);
         assert_eq!(c.volumes, ["data"]);
@@ -1188,8 +1220,8 @@ mod tests {
 
     #[test]
     fn include_and_extends_are_partial() {
-        let yaml = "include:\n  - other.yaml\nservices:\n  app:\n    extends:\n      file: base.yaml\n      service: base\n    labels:\n      orca.managed: 'true'\n    network_mode: host\n";
-        let c = audit(yaml).unwrap();
+        let yaml = "include:\n  - other.yaml\nservices:\n  app:\n    extends:\n      file: base.yaml\n      service: base\n    labels:\n      orca.managed: 'true'\n      orca.owner: dockge\n      orca.stack: media\n    network_mode: host\n";
+        let c = audit(yaml, "media", "").unwrap();
         assert!(c.partial);
         assert!(c.services.is_empty());
         assert!(!c.is_complete());
@@ -1200,8 +1232,8 @@ mod tests {
 
     #[test]
     fn audit_refuses_an_empty_compose() {
-        assert!(audit("").is_err());
-        assert!(audit("# just comments\n").is_err());
+        assert!(audit("", "media", "").is_err());
+        assert!(audit("# just comments\n", "media", "").is_err());
         assert!(label("", "media", Previous::New, "").is_err());
     }
 
@@ -1412,9 +1444,66 @@ mod tests {
         let crlf = label(&yaml.replace('\n', "\r\n"), "media", Previous::New, "").unwrap();
         assert_eq!(
             crlf.unlabeled,
-            ["service 'app'", "volume 'data'", "network 'backend'"]
+            [
+                "service 'app'",
+                "volume 'data'",
+                "network 'backend'",
+                "network 'default'"
+            ]
         );
         assert!(crlf.assumed_new.is_empty());
+    }
+
+    #[test]
+    fn an_unresolvable_project_name_labels_nothing() {
+        let body = "services:\n  app:\n    image: x\n";
+        for (yaml, env) in [
+            (format!("name: ${{P}}\n{body}"), ""),
+            (format!("name: TV\n{body}"), ""),
+            (format!("name: tv\n{body}"), "COMPOSE_PROJECT_NAME=tv-$X\n"),
+            (format!("name: tv\n{body}"), "COMPOSE_PROJECT_NAME=_tv\n"),
+        ] {
+            let l = label(&yaml, "media", Previous::New, env).unwrap();
+            assert_eq!(l.yaml, yaml, "{env}");
+            assert_eq!(l.unlabeled, ["service 'app'", "network 'default'"]);
+            assert!(
+                l.notes
+                    .iter()
+                    .any(|n| n.starts_with("labels not applied: project name")),
+                "{:?}",
+                l.notes
+            );
+            assert!(audit(&yaml, "media", env).is_err());
+        }
+    }
+
+    #[test]
+    fn the_stack_name_fallback_is_normalized_like_compose() {
+        assert_eq!(normalize_project("_-My.App 2"), "myapp2");
+        let (v, _) = {
+            let l = label(
+                "services:\n  app:\n    image: x\n",
+                "-My.Stack",
+                Previous::New,
+                "",
+            )
+            .unwrap();
+            (serde_yaml::from_str::<Value>(&l.yaml).unwrap(), l.notes)
+        };
+        assert_eq!(v["services"]["app"]["labels"][STACK], "mystack");
+        assert_eq!(v["services"]["app"]["labels"][UNIT], "-My.Stack");
+        let l = label("services:\n  app:\n    image: x\n", "__", Previous::New, "").unwrap();
+        assert_eq!(l.unlabeled, ["service 'app'", "network 'default'"]);
+    }
+
+    #[test]
+    fn audit_counts_only_this_stacks_dockge_labels() {
+        let yaml = "services:\n  app:\n    image: x\n    network_mode: host\n    labels:\n      orca.managed: 'true'\n      orca.owner: docker\n      orca.stack: media\n  web:\n    image: y\n    network_mode: host\n    labels:\n      orca.managed: 'true'\n      orca.owner: dockge\n      orca.stack: other\n";
+        assert_eq!(audit(yaml, "media", "").unwrap().services, ["app", "web"]);
+        let fresh = "services:\n  app:\n    image: x\nvolumes:\n  data:\n";
+        let l = label(fresh, "media", Previous::New, "").unwrap();
+        assert!(audit(&l.yaml, "media", "").unwrap().is_complete());
+        assert!(!audit(&l.yaml, "tv", "").unwrap().is_complete());
     }
 
     #[test]

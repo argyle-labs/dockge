@@ -117,6 +117,12 @@ fn scalar_header(l: &str) -> Option<usize> {
         }
         None => strip_comment(t).to_string(),
     };
+    let mut value = value.as_str();
+    while value.starts_with(['!', '&']) {
+        value = value
+            .split_once([' ', '\t'])
+            .map_or("", |(_, r)| r.trim_start());
+    }
     value.starts_with(['|', '>']).then_some(col)
 }
 
@@ -603,6 +609,17 @@ mod tests {
         assert_eq!(entry("image:\tx\t# c"), Some(("image".into(), "x".into())));
         assert_eq!(strip_comment("x\t#c"), "x");
         assert_eq!(strip_comment("a#b"), "a#b");
+    }
+
+    #[test]
+    fn block_scalars_behind_a_tag_or_anchor_are_text() {
+        for header in ["!!str |", "&c |", "!!str &c >-", "&c !t |"] {
+            let src =
+                format!("a:\n  cmd: {header}\n    echo\n    # kept\n  - {header}\n    x\nb: 1\n");
+            let t = Text::new(&src).unwrap();
+            assert_eq!(t.end(0), 5, "{header}");
+            assert!(t.body[3] && t.body[5] && !t.body[6], "{header}");
+        }
     }
 
     #[test]

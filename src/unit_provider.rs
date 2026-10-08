@@ -144,7 +144,14 @@ impl DockgeUnitProvider {
         let client = make_client(&ep)?;
         let mut stack = client.get_stack(&args.id.id).await?;
         let ownership = match stack.pointer("/stack/composeYAML").and_then(Value::as_str) {
-            Some(yaml) => match crate::ownership::audit(yaml) {
+            Some(yaml) => match crate::ownership::audit(
+                yaml,
+                &args.id.id,
+                stack
+                    .pointer("/stack/composeENV")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ) {
                 Ok(c) => json!({ "complete": c.is_complete(), "unlabeled": c }),
                 Err(e) => json!({ "error": format!("{e:#}") }),
             },
@@ -205,8 +212,9 @@ impl DockgeUnitProvider {
         Ok(labeled)
     }
 
-    /// `labeled.notes`, plus the engine state a new stack's labels assume:
-    /// the plugin cannot see whether those volumes and networks exist.
+    /// `labeled.notes`, plus the engine state the labels on volumes and
+    /// networks new to the stack assume: the plugin cannot see whether they
+    /// exist.
     fn dry_run_notes(labeled: &Labeled) -> Vec<String> {
         let mut notes = labeled.notes.clone();
         notes.extend(labeled.assumed_new.iter().map(|r| {
