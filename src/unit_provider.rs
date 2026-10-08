@@ -198,10 +198,21 @@ impl DockgeUnitProvider {
         let (compose_yaml, mut notes) =
             crate::compose_mounts::ensure_bind_propagation(&p.compose_yaml)
                 .unwrap_or_else(|_| (p.compose_yaml.clone(), Vec::new()));
-        let mut labeled = crate::ownership::label(&compose_yaml, &p.name, previous)?;
+        let mut labeled =
+            crate::ownership::label(&compose_yaml, &p.name, previous, &p.compose_env)?;
         notes.append(&mut labeled.notes);
         labeled.notes = notes;
         Ok(labeled)
+    }
+
+    /// `labeled.notes`, plus the engine state a new stack's labels assume:
+    /// the plugin cannot see whether those volumes and networks exist.
+    fn dry_run_notes(labeled: &Labeled) -> Vec<String> {
+        let mut notes = labeled.notes.clone();
+        notes.extend(labeled.assumed_new.iter().map(|r| {
+            format!("{r} will be labeled, assuming it does not already exist in the engine")
+        }));
+        notes
     }
 
     /// Deploy a stack. `is_add` = true creates a fresh stack (dockge errors if it
@@ -232,6 +243,7 @@ impl DockgeUnitProvider {
                 "dryRun": false,
                 "deployed": true,
                 "notes": labeled.notes,
+                "unlabeled": labeled.unlabeled,
             })
         } else {
             json!({
@@ -242,7 +254,8 @@ impl DockgeUnitProvider {
                 "add": is_add,
                 "diff": crate::ownership::diff(&p.compose_yaml, &labeled.yaml),
                 "composeYaml": labeled.yaml,
-                "notes": labeled.notes,
+                "notes": Self::dry_run_notes(&labeled),
+                "unlabeled": labeled.unlabeled,
             })
         };
         Ok(VerbOutcome::Item(ItemOutcome::new(
@@ -412,6 +425,34 @@ mod tests {
         assert_eq!(app["labels"][crate::labels::UNIT], "media");
         let d = crate::ownership::diff(&p.compose_yaml, &l.yaml);
         assert!(d.contains("+    labels:"), "{d}");
+    }
+
+    #[test]
+    fn new_stack_dry_run_names_what_it_assumes_is_absent() {
+        let p = payload(
+            "services:\n  app:\n    image: x\n    volumes:\n      - data:/data\nvolumes:\n  data:\n",
+        );
+        let l = DockgeUnitProvider::prepare(&p, Previous::New).unwrap();
+        let notes = DockgeUnitProvider::dry_run_notes(&l);
+        for r in ["volume 'data'", "network 'default'"] {
+            assert!(
+                notes.contains(&format!(
+                    "{r} will be labeled, assuming it does not already exist in the engine"
+                )),
+                "{notes:?}"
+            );
+        }
+        let l = DockgeUnitProvider::prepare(&p, Previous::Compose(&p.compose_yaml)).unwrap();
+        assert!(l.assumed_new.is_empty(), "{:?}", l.assumed_new);
+    }
+
+    #[test]
+    fn prepare_takes_the_project_from_compose_env() {
+        let mut p = payload("name: other\nservices:\n  app:\n    image: x\n");
+        p.compose_env = "TZ=UTC\nCOMPOSE_PROJECT_NAME=tv\n".into();
+        let l = DockgeUnitProvider::prepare(&p, Previous::New).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(v["services"]["app"]["labels"][crate::labels::STACK], "tv");
     }
 
     #[test]

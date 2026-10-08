@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_match_the_docker_plugin_contract() {
+    fn label_key_constants_are_pinned() {
         assert_eq!(
             [MANAGED, OWNER, STACK, SERVICE, UNIT, MOUNT],
             [

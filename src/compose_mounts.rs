@@ -57,33 +57,29 @@ pub fn ensure_bind_propagation(compose_yaml: &str) -> Result<(String, Vec<String
     let mut oracle = doc.clone();
     let mut notes = Vec::new();
     for (svc, i, old, new) in planned {
-        let saved = text.clone();
-        match edit_bind(&mut text, &svc, i, &old, &new) {
-            Ok(()) => {
-                if let Some(slot) = oracle
-                    .get_mut("services")
-                    .and_then(|s| s.get_mut(svc.as_str()))
-                    .and_then(|s| s.get_mut("volumes"))
-                    .and_then(|v| v.get_mut(i))
-                {
-                    *slot = new;
-                }
+        let saved = (text.clone(), oracle.clone());
+        let outcome = edit_bind(&mut text, &svc, i, &old, &new).and_then(|()| {
+            if let Some(slot) = oracle
+                .get_mut("services")
+                .and_then(|s| s.get_mut(svc.as_str()))
+                .and_then(|s| s.get_mut("volumes"))
+                .and_then(|v| v.get_mut(i))
+            {
+                *slot = new;
             }
-            Err(why) => {
-                text = saved;
-                notes.push(format!(
-                    "service '{svc}' volume {i}: bind propagation not set: {why}"
-                ));
-            }
+            text.reads_back_as(&oracle)
+        });
+        if let Err(why) = outcome {
+            (text, oracle) = saved;
+            notes.push(format!(
+                "service '{svc}' volume {i}: bind propagation not set: {why}"
+            ));
         }
     }
-    let out = text.render();
-    if serde_yaml::from_str::<Value>(&out).ok().as_ref() != Some(&oracle) {
-        return unchanged(vec![
-            "bind propagation not set: the edited compose did not read back as intended".into(),
-        ]);
+    if oracle == doc {
+        return unchanged(notes);
     }
-    Ok((out, notes))
+    Ok((text.render(), notes))
 }
 
 fn edit_bind(text: &mut Text, svc: &str, i: usize, old: &Value, new: &Value) -> Result<(), String> {
@@ -303,6 +299,27 @@ mod tests {
         let (out, notes) = ensure_bind_propagation(yaml).unwrap();
         assert_eq!(out, yaml);
         assert_eq!(notes.len(), 1, "{notes:?}");
+    }
+
+    #[test]
+    fn a_failed_read_back_undoes_only_that_bind() {
+        let yaml = "# binds\nservices:\n  app:\n    volumes:\n      - /srv/a:/a # first\n      - /srv/b:/b\n";
+        crate::yaml_text::sabotage::arm(Some("propagation"));
+        let (out, notes) = ensure_bind_propagation(yaml).unwrap();
+        assert_eq!(out, yaml);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[0].contains("did not read back as intended"),
+            "{notes:?}"
+        );
+
+        crate::yaml_text::sabotage::arm(Some("source: \"/srv/b\""));
+        let (out, notes) = ensure_bind_propagation(yaml).unwrap();
+        crate::yaml_text::sabotage::arm(None);
+        assert_eq!(volume(&out, "app", 0)["bind"]["propagation"], "rslave");
+        assert_eq!(volume(&out, "app", 1), Value::from("/srv/b:/b"));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("service 'app' volume 1:"), "{notes:?}");
     }
 
     #[test]

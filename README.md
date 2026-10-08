@@ -85,7 +85,10 @@ into the compose. Without `"execute": true` in the payload they change nothing
 and return the compose that would be sent plus its diff. Volumes and networks
 the stack already had without orca labels are not relabeled, since compose
 would recreate them. On a new stack, anonymous volumes become named volumes
-`<project>_<service>_<path-slug>`. The `update` action redeploys the stored
+`<project>_<service>_<path-slug>`. The project is `COMPOSE_PROJECT_NAME`
+from the stack's env, else the compose `name:`, else the stack name. Every
+response lists the resources left without labels in `unlabeled`, with the
+reasons in `notes`. The `update` action redeploys the stored
 compose unchanged; run `upsert` to label an existing stack.
 
 ### Topology

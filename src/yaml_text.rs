@@ -19,6 +19,9 @@ pub type Refusal = String;
 #[derive(Debug, Clone)]
 pub struct Text {
     lines: Vec<String>,
+    /// Non-blank lines inside a block scalar: text, even when they look like
+    /// a comment or a key.
+    body: Vec<bool>,
     trailing_newline: bool,
     /// Indent step for new nested lines, taken from the `services` block.
     unit: usize,
@@ -31,6 +34,10 @@ fn indent(l: &str) -> usize {
 fn is_content(l: &str) -> bool {
     let t = l.trim();
     !t.is_empty() && !t.starts_with('#')
+}
+
+fn is_directive(l: &str) -> bool {
+    l.starts_with('%')
 }
 
 fn is_item(l: &str) -> bool {
@@ -51,7 +58,11 @@ fn strip_comment(rest: &str) -> &str {
     if rest.starts_with(['"', '\'']) {
         return rest;
     }
-    rest.find(" #").map_or(rest, |i| &rest[..i]).trim_end()
+    rest.match_indices([' ', '\t'])
+        .map(|(i, _)| i)
+        .find(|&i| rest[i + 1..].starts_with('#'))
+        .map_or(rest, |i| &rest[..i])
+        .trim_end()
 }
 
 /// `(key, rest)` of a block mapping entry; `rest` is the value text on the
@@ -70,12 +81,12 @@ fn entry(text: &str) -> Option<(String, String)> {
             let colon = t
                 .match_indices(':')
                 .map(|(i, _)| i)
-                .find(|&i| t[i + 1..].is_empty() || t[i + 1..].starts_with(' '))?;
+                .find(|&i| t[i + 1..].is_empty() || t[i + 1..].starts_with([' ', '\t']))?;
             (t[..colon].trim_end().to_string(), &t[colon..])
         }
     };
     let rest = after.trim_start().strip_prefix(':')?;
-    if !(rest.is_empty() || rest.starts_with(' ')) {
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
         return None;
     }
     Some((key, strip_comment(rest.trim()).to_string()))
@@ -85,6 +96,51 @@ fn entry(text: &str) -> Option<(String, String)> {
 fn after_dash(l: &str) -> &str {
     let t = l.trim_start();
     t.strip_prefix('-').unwrap_or(t)
+}
+
+/// The column a block scalar starting on `l` must be indented past, or
+/// `None` when `l` does not start one.
+fn scalar_header(l: &str) -> Option<usize> {
+    let mut pos = indent(l);
+    let mut col = pos;
+    let mut t = &l[pos..];
+    while is_item(t) {
+        col = pos;
+        let rest = t[1..].trim_start();
+        pos += t.len() - rest.len();
+        t = rest;
+    }
+    let value = match entry(t) {
+        Some((_, r)) => {
+            col = pos;
+            r
+        }
+        None => strip_comment(t).to_string(),
+    };
+    value.starts_with(['|', '>']).then_some(col)
+}
+
+fn scan_body(lines: &[String]) -> Vec<bool> {
+    let mut body = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(col) = scalar_header(&lines[i]) else {
+            i += 1;
+            continue;
+        };
+        i += 1;
+        while i < lines.len() {
+            let l = &lines[i];
+            if !l.trim().is_empty() {
+                if indent(l) <= col {
+                    break;
+                }
+                body[i] = true;
+            }
+            i += 1;
+        }
+    }
+    body
 }
 
 fn describe(rest: &str) -> Refusal {
@@ -138,14 +194,20 @@ impl Text {
         if src.contains('\r') {
             return Err("it has CRLF line endings".into());
         }
+        let lines: Vec<String> = src.lines().map(str::to_string).collect();
         let mut t = Self {
-            lines: src.lines().map(str::to_string).collect(),
+            body: scan_body(&lines),
+            lines,
             trailing_newline: src.is_empty() || src.ends_with('\n'),
             unit: 2,
         };
         let mut first = true;
-        for l in t.lines.iter().filter(|l| is_content(l)) {
+        for i in (0..t.lines.len()).filter(|&i| t.content(i) && !t.body[i]) {
+            let l = &t.lines[i];
             let s = l.trim_end();
+            if first && is_directive(s) {
+                continue;
+            }
             if (s.starts_with("---") && !first) || s == "..." {
                 return Err("it holds more than one YAML document".into());
             }
@@ -174,8 +236,32 @@ impl Text {
         s
     }
 
-    fn is_marker(&self, i: usize) -> bool {
-        self.lines[i].starts_with("---") && !(0..i).any(|j| is_content(&self.lines[j]))
+    /// `Err` unless the rendered text parses to `doc`; an edit is only kept
+    /// when it does.
+    pub fn reads_back_as(&self, doc: &Value) -> Result<(), Refusal> {
+        let text = self.render();
+        #[cfg(test)]
+        let text = sabotage::apply(text);
+        match serde_yaml::from_str::<Value>(&text) {
+            Ok(v) if &v == doc => Ok(()),
+            _ => Err("the edited compose did not read back as intended".into()),
+        }
+    }
+
+    fn content(&self, i: usize) -> bool {
+        self.body[i] || is_content(&self.lines[i])
+    }
+
+    /// A `---` or `%` directive line before the root mapping.
+    fn is_header(&self, i: usize) -> bool {
+        let l = &self.lines[i];
+        (l.starts_with("---") || is_directive(l))
+            && !(0..i).any(|j| self.content(j) && !is_directive(&self.lines[j]))
+    }
+
+    fn splice(&mut self, range: std::ops::Range<usize>, lines: Vec<String>) {
+        self.lines.splice(range, lines);
+        self.body = scan_body(&self.lines);
     }
 
     /// Last line of the node starting at line `at`.
@@ -185,10 +271,10 @@ impl Text {
         let mut end = at;
         let mut compact = None;
         for i in at + 1..self.lines.len() {
-            let l = &self.lines[i];
-            if !is_content(l) {
+            if !self.content(i) {
                 continue;
             }
+            let l = &self.lines[i];
             let ind = indent(l);
             let c = *compact.get_or_insert(key_line && ind == k && is_item(l));
             if ind > k || (c && ind == k && is_item(l)) {
@@ -206,7 +292,7 @@ impl Text {
             None => (0, self.lines.len()),
             Some(at) => (at + 1, self.end(at) + 1),
         };
-        let content = |i: &usize| is_content(&self.lines[*i]) && !self.is_marker(*i);
+        let content = |i: &usize| self.content(*i) && !self.is_header(*i);
         let first = (start..stop).find(content)?;
         let c = indent(&self.lines[first]);
         Some((
@@ -261,7 +347,7 @@ impl Text {
 
     fn insert_after(&mut self, at: usize, lines: Vec<String>) {
         let at = at + 1;
-        self.lines.splice(at..at, lines);
+        self.splice(at..at, lines);
     }
 
     /// Set `wanted` in the `labels` of the node at `at`. `current` is its own
@@ -316,7 +402,7 @@ impl Text {
             match existing {
                 Some(i) => {
                     let e = self.end(i);
-                    self.lines.splice(i..=e, [line]);
+                    self.splice(i..e + 1, vec![line]);
                 }
                 None => {
                     let e = self.end(l);
@@ -339,7 +425,7 @@ impl Text {
             None => {
                 let last = (0..self.lines.len())
                     .rev()
-                    .find(|&i| is_content(&self.lines[i]))
+                    .find(|&i| self.content(i))
                     .ok_or("the file is empty")?;
                 self.insert_after(last, vec![format!("{section}:")]);
                 last + 1
@@ -379,7 +465,7 @@ impl Text {
         if self.end(item) != item || rest.starts_with(['&', '*', '{', '[', '|', '>', '!']) {
             return Err("the item is not a plain one-line value".into());
         }
-        self.lines.splice(item..=item, lines);
+        self.splice(item..item + 1, lines);
         Ok(())
     }
 
@@ -395,8 +481,8 @@ impl Text {
         if t.is_empty() || t.starts_with('#') {
             let e = self.end(item);
             return (item + 1..=e)
-                .find(|&j| is_content(&self.lines[j]))
-                .filter(|&j| entry(&self.lines[j]).is_some())
+                .find(|&j| self.content(j))
+                .filter(|&j| !self.body[j] && entry(&self.lines[j]).is_some())
                 .map(|j| indent(&self.lines[j]));
         }
         entry(t).map(|_| indent(l) + 1 + after.len() - t.len())
@@ -450,6 +536,29 @@ impl Text {
     }
 }
 
+/// Forces [`Text::reads_back_as`] to fail, so tests reach the fallback that
+/// a misplaced edit takes.
+#[cfg(test)]
+pub(crate) mod sabotage {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static WHEN: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Fail read-back of any text containing `when`, on this thread.
+    pub fn arm(when: Option<&str>) {
+        WHEN.with(|w| *w.borrow_mut() = when.map(str::to_string));
+    }
+
+    pub(super) fn apply(text: String) -> String {
+        match WHEN.with(|w| w.borrow().clone()) {
+            Some(when) if text.contains(&when) => text + "x-sabotage: true\n",
+            _ => text,
+        }
+    }
+}
+
 /// The label key of a list-form label item (`k=v`).
 fn list_label_key(item: &str) -> Option<String> {
     let s: String = serde_yaml::from_str(strip_comment(item.trim())).ok()?;
@@ -480,5 +589,29 @@ mod tests {
     fn multi_document_files_are_refused() {
         assert!(Text::new("---\na: 1\n").is_ok());
         assert!(Text::new("a: 1\n---\nb: 2\n").is_err());
+    }
+
+    #[test]
+    fn a_yaml_directive_before_the_document_is_allowed() {
+        let t = Text::new("%YAML 1.2\n---\na:\n  b: 1\n").unwrap();
+        assert_eq!(t.path(&["a", "b"]), Ok(3));
+    }
+
+    #[test]
+    fn tabs_separate_values_and_comments() {
+        assert_eq!(entry("labels:\t# c"), Some(("labels".into(), "".into())));
+        assert_eq!(entry("image:\tx\t# c"), Some(("image".into(), "x".into())));
+        assert_eq!(strip_comment("x\t#c"), "x");
+        assert_eq!(strip_comment("a#b"), "a#b");
+    }
+
+    #[test]
+    fn hash_lines_inside_a_block_scalar_are_text() {
+        let src = "a:\n  cmd: |\n    echo\n    # kept\nb:\n  - |-\n    x\n    # also\n  - y\n";
+        assert!(serde_yaml::from_str::<Value>(src).is_ok());
+        let t = Text::new(src).unwrap();
+        assert_eq!(t.end(0), 3);
+        assert_eq!(t.end(4), 8);
+        assert!(t.body[3] && t.body[7] && !t.body[8]);
     }
 }

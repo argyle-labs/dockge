@@ -30,7 +30,7 @@ use plugin_toolkit::serde::Serialize;
 use serde_yaml::{Mapping, Value};
 
 use crate::compose_mounts::is_host_path;
-use crate::labels::{self, Labels, OWNER_DOCKGE};
+use crate::labels::{self, Labels, OWNER, OWNER_DOCKGE, STACK};
 use crate::yaml_text::{Refusal, Text, quote};
 
 /// `/var/lib/app data` → `var_lib_app_data`.
@@ -70,6 +70,11 @@ pub struct Labeled {
     pub yaml: String,
     /// Resources left unlabeled, and why.
     pub notes: Vec<String>,
+    /// Resources left without orca's labels, e.g. `volume 'data'`.
+    pub unlabeled: Vec<String>,
+    /// Volumes and networks of a new stack that carry orca's labels on the
+    /// assumption that the engine has none by that name yet.
+    pub assumed_new: Vec<String>,
 }
 
 /// Resources a stack's compose leaves without orca's labels.
@@ -146,10 +151,17 @@ fn is_external(entry: Option<&Value>) -> bool {
         .is_some_and(|x| !matches!(x, Value::Bool(false) | Value::Null))
 }
 
-/// An explicitly named volume or network already carrying orca's labels is
-/// one a previous deploy converted; it is left as written.
 fn is_managed(entry: Option<&Value>) -> bool {
     labels::is_managed(label_map(entry.and_then(|e| e.get("labels"))).iter())
+}
+
+/// An explicitly named volume or network already carrying the labels this
+/// stack writes is one a previous deploy converted; it is left as written.
+fn is_ours(entry: Option<&Value>, project: &str) -> bool {
+    let have = label_map(entry.and_then(|e| e.get("labels")));
+    labels::is_managed(have.iter())
+        && have.get(OWNER).map(String::as_str) == Some(OWNER_DOCKGE)
+        && have.get(STACK).map(String::as_str) == Some(project)
 }
 
 fn uses_default_network(spec: &Value) -> bool {
@@ -225,7 +237,9 @@ fn merged(doc: &Value) -> Result<Value> {
 }
 
 fn has_services(doc: &Value) -> bool {
-    doc.get("services").is_some_and(Value::is_mapping)
+    doc.get("services")
+        .and_then(Value::as_mapping)
+        .is_some_and(|m| !m.is_empty())
 }
 
 /// What [`label`] and [`audit`] cannot see: `include:` files and the
@@ -322,7 +336,7 @@ enum Before {
 impl Before {
     /// Dockge answers an unreadable compose with an empty string, and a file
     /// of comments parses to null: neither says what exists, so anything but
-    /// a document with `services` is unknown.
+    /// a document with at least one service is unknown.
     fn new(previous: Previous<'_>) -> Self {
         match previous {
             Previous::New => Before::New,
@@ -377,17 +391,31 @@ struct Editor {
     text: Text,
     doc: Value,
     notes: Vec<String>,
+    unlabeled: Vec<String>,
 }
 
 impl Editor {
-    /// Run `f`; on refusal undo whatever it changed and note why.
-    fn try_edit(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<(), Refusal>) -> bool {
+    fn skip(&mut self, resource: &str, why: &str) {
+        self.notes.push(format!("{resource} {why}"));
+        self.unlabeled.push(resource.to_string());
+    }
+
+    /// Run `f`, then check the text still reads back as the document. On
+    /// refusal or mismatch undo only this edit and leave `resource`
+    /// unlabeled.
+    fn try_edit(
+        &mut self,
+        resource: &str,
+        verb: &str,
+        f: impl FnOnce(&mut Self) -> Result<(), Refusal>,
+    ) -> bool {
         let saved = (self.text.clone(), self.doc.clone());
-        match f(self) {
+        let outcome = f(self).and_then(|()| self.text.reads_back_as(&self.doc));
+        match outcome {
             Ok(()) => true,
             Err(why) => {
                 (self.text, self.doc) = saved;
-                self.notes.push(format!("{what}: {why}"));
+                self.skip(resource, &format!("{verb}: {why}"));
                 false
             }
         }
@@ -398,7 +426,13 @@ impl Editor {
     }
 
     /// Set `wanted` on the existing node `section.key`.
-    fn label(&mut self, section: &str, key: &str, wanted: &BTreeMap<String, String>, what: &str) {
+    fn label(
+        &mut self,
+        section: &str,
+        key: &str,
+        wanted: &BTreeMap<String, String>,
+        resource: &str,
+    ) {
         let raw = self
             .doc
             .get(section)
@@ -414,7 +448,7 @@ impl Editor {
         if wanted.iter().all(|(k, v)| effective.get(k) == Some(v)) {
             return;
         }
-        self.try_edit(&format!("{what} not labeled"), |e| {
+        self.try_edit(resource, "not labeled", |e| {
             let at = e.text.path(&[section, key])?;
             e.text.set_labels(at, wanted, own.as_ref(), &seed)?;
             if let Some(node) = e.node(section, key) {
@@ -475,6 +509,30 @@ impl Editor {
     }
 }
 
+/// `COMPOSE_PROJECT_NAME` from a dotenv `compose_env`; compose lets it
+/// override the `name:` key.
+fn env_project(compose_env: &str) -> Option<String> {
+    compose_env
+        .lines()
+        .rev()
+        .filter_map(|l| {
+            let l = l.trim();
+            let l = l.strip_prefix("export ").unwrap_or(l).trim_start();
+            let (k, v) = l.split_once('=')?;
+            if k.trim() != "COMPOSE_PROJECT_NAME" {
+                return None;
+            }
+            let v = v.trim();
+            let v = match v.chars().next() {
+                Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or_default(),
+                _ => v.split(" #").next().unwrap_or_default().trim_end(),
+            };
+            Some(v.to_string())
+        })
+        .next()
+        .filter(|v| !v.is_empty())
+}
+
 fn labels_body(labels: &BTreeMap<String, String>) -> Mapping {
     let mut m = Mapping::new();
     m.insert(
@@ -489,10 +547,40 @@ fn labels_body(labels: &BTreeMap<String, String>) -> Mapping {
     m
 }
 
+/// Every resource [`label`] would consider in `doc`.
+fn resources(doc: &Value) -> Vec<String> {
+    let keys = |section: &str| -> Vec<String> {
+        doc.get(section)
+            .and_then(Value::as_mapping)
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| !is_external(Some(v)))
+            .filter_map(|(k, _)| k.as_str().map(str::to_string))
+            .collect()
+    };
+    let mut out: Vec<String> = keys("services")
+        .into_iter()
+        .map(|k| format!("service '{k}'"))
+        .collect();
+    out.extend(keys("volumes").into_iter().map(|k| format!("volume '{k}'")));
+    out.extend(
+        keys("networks")
+            .into_iter()
+            .map(|k| format!("network '{k}'")),
+    );
+    out
+}
+
 /// Write orca's ownership labels into `compose_yaml` for dockge stack
-/// `stack`. Unchanged input is returned byte-for-byte; so is the input when
-/// the edited text would not read back as the intended document.
-pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<Labeled> {
+/// `stack`, deployed with the dotenv `compose_env`. Unchanged input is
+/// returned byte-for-byte. An edit whose text would not read back as the
+/// intended document is undone and its resource reported unlabeled.
+pub fn label(
+    compose_yaml: &str,
+    stack: &str,
+    previous: Previous<'_>,
+    compose_env: &str,
+) -> Result<Labeled> {
     let original = parse(compose_yaml)?;
     if !original.is_mapping() {
         bail!("compose is empty or not a YAML mapping");
@@ -500,32 +588,39 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
     let resolved = merged(&original)?;
     let before = Before::new(previous);
     let mut notes = partial_notes(&resolved);
-    let unchanged = |notes| {
+    let unchanged = |notes, unlabeled| {
         Ok(Labeled {
             yaml: compose_yaml.to_string(),
             notes,
+            unlabeled,
+            assumed_new: Vec::new(),
         })
     };
     let Some(services) = resolved.get("services").and_then(Value::as_mapping) else {
-        return unchanged(notes);
+        return unchanged(notes, Vec::new());
     };
     let text = match Text::new(compose_yaml) {
         Ok(t) => t,
         Err(why) => {
             notes.push(format!("labels not applied: {why}"));
-            return unchanged(notes);
+            return unchanged(notes, resources(&resolved));
         }
     };
-    let project = resolved
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or(stack)
-        .to_string();
+    let project = env_project(compose_env)
+        .or_else(|| {
+            resolved
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| stack.to_string());
     let mut e = Editor {
         text,
         doc: original.clone(),
         notes,
+        unlabeled: Vec::new(),
     };
+    let mut assumed_new = Vec::new();
 
     let mut mounts: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut anonymous: Vec<(String, usize, String, Option<i64>)> = Vec::new();
@@ -572,23 +667,26 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
     for (svc, i, target, replicas) in anonymous {
         let what = format!("service '{svc}' anonymous volume at {target}");
         if !matches!(before, Before::New) {
-            e.notes.push(format!(
-                "{what} cannot carry labels; not converted on an existing stack (it would mount a new, empty volume)"
-            ));
+            e.skip(
+                &what,
+                "cannot carry labels; not converted on an existing stack (it would mount a new, empty volume)",
+            );
             continue;
         }
         if replicas != Some(1) {
-            e.notes.push(format!(
-                "{what} cannot carry labels; not converted on a service with more than one replica (they would share one volume)"
-            ));
+            e.skip(
+                &what,
+                "cannot carry labels; not converted on a service with more than one replica (they would share one volume)",
+            );
             continue;
         }
         let volume = format!("{svc}_{}", slug(&target));
         let name = format!("{project}_{volume}");
         if taken.contains(&volume) || engine_names.contains(&name) {
-            e.notes.push(format!(
-                "{what} not converted: volume '{volume}' ({name}) is already declared"
-            ));
+            e.skip(
+                &what,
+                &format!("not converted: volume '{volume}' ({name}) is already declared"),
+            );
             continue;
         }
         let mut body = Mapping::new();
@@ -598,10 +696,11 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
                 .with_mount(&target)
                 .to_map(),
         ));
-        if e.try_edit(&format!("{what} not converted"), |e| {
+        if e.try_edit(&what, "not converted", |e| {
             e.add("volumes", &volume, body)?;
             e.convert(&svc, i, &volume, &target)
         }) {
+            assumed_new.push(format!("volume '{volume}'"));
             taken.insert(volume);
             engine_names.insert(name);
         }
@@ -611,13 +710,14 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
         if is_external(Some(entry)) {
             continue;
         }
+        let resource = format!("volume '{key}'");
         if entry.get("name").is_some() {
-            if is_managed(Some(entry)) {
-                continue;
+            if !is_ours(Some(entry), &project) {
+                e.skip(
+                    &resource,
+                    "sets an explicit name; not labeled (it may be shared outside this stack)",
+                );
             }
-            e.notes.push(format!(
-                "volume '{key}' sets an explicit name; not labeled (it may be shared outside this stack)"
-            ));
             continue;
         }
         let wanted = match mounts.get(key).map(Vec::as_slice) {
@@ -627,11 +727,15 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
             _ => Labels::for_(OWNER_DOCKGE, &project, None, Some(stack)),
         };
         match before.prior("volumes", key) {
-            Prior::Absent => e.label("volumes", key, &wanted.to_map(), &format!("volume '{key}'")),
-            Prior::Managed(have) => e.label("volumes", key, &have, &format!("volume '{key}'")),
-            Prior::Unlabeled => e.notes.push(format!(
-                "volume '{key}' was deployed without orca labels; not relabeled (compose would recreate it)"
-            )),
+            Prior::Absent => {
+                e.label("volumes", key, &wanted.to_map(), &resource);
+                assumed_new.push(resource);
+            }
+            Prior::Managed(have) => e.label("volumes", key, &have, &resource),
+            Prior::Unlabeled => e.skip(
+                &resource,
+                "was deployed without orca labels; not relabeled (compose would recreate it)",
+            ),
         }
     }
 
@@ -652,30 +756,34 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
         if is_external(entry) {
             continue;
         }
+        let what = format!("network '{key}'");
         if entry.and_then(|n| n.get("name")).is_some() {
-            if is_managed(entry) {
-                continue;
+            if !is_ours(entry, &project) {
+                e.skip(
+                    &what,
+                    "sets an explicit name; not labeled (it may be shared outside this stack)",
+                );
             }
-            e.notes.push(format!(
-                "network '{key}' sets an explicit name; not labeled (it may be shared outside this stack)"
-            ));
             continue;
         }
-        let what = format!("network '{key}'");
         let labels = match before.prior("networks", &key) {
-            Prior::Absent => Labels::for_(OWNER_DOCKGE, &project, None, Some(stack)).to_map(),
+            Prior::Absent => {
+                assumed_new.push(what.clone());
+                Labels::for_(OWNER_DOCKGE, &project, None, Some(stack)).to_map()
+            }
             Prior::Managed(have) => have,
             Prior::Unlabeled => {
-                e.notes.push(format!(
-                    "{what} was deployed without orca labels; not relabeled (compose would recreate it)"
-                ));
+                e.skip(
+                    &what,
+                    "was deployed without orca labels; not relabeled (compose would recreate it)",
+                );
                 continue;
             }
         };
         if entry.is_some() {
             e.label("networks", &key, &labels, &what);
         } else {
-            e.try_edit(&format!("{what} not labeled"), |e| {
+            e.try_edit(&what, "not labeled", |e| {
                 e.add("networks", &key, labels_body(&labels))
             });
         }
@@ -684,19 +792,24 @@ pub fn label(compose_yaml: &str, stack: &str, previous: Previous<'_>) -> Result<
     let Editor {
         text,
         doc,
-        mut notes,
+        notes,
+        unlabeled,
     } = e;
-    if doc == original {
-        return unchanged(notes);
+    if !matches!(before, Before::New) {
+        assumed_new.clear();
     }
-    let yaml = text.render();
-    if serde_yaml::from_str::<Value>(&yaml).ok().as_ref() != Some(&doc) {
-        notes.push(
-            "labels not applied: the edited compose did not read back as intended".to_string(),
-        );
-        return unchanged(notes);
-    }
-    Ok(Labeled { yaml, notes })
+    assumed_new.retain(|r| !unlabeled.contains(r));
+    let yaml = if doc == original {
+        compose_yaml.to_string()
+    } else {
+        text.render()
+    };
+    Ok(Labeled {
+        yaml,
+        notes,
+        unlabeled,
+        assumed_new,
+    })
 }
 
 /// What `compose_yaml` leaves without orca's labels.
@@ -802,7 +915,7 @@ mod tests {
     use crate::labels::{MANAGED, MOUNT, OWNER, SERVICE, STACK, UNIT};
 
     fn labeled(yaml: &str, previous: Previous<'_>) -> (Value, Vec<String>) {
-        let l = label(yaml, "media", previous).unwrap();
+        let l = label(yaml, "media", previous, "").unwrap();
         (serde_yaml::from_str(&l.yaml).unwrap(), l.notes)
     }
 
@@ -932,15 +1045,15 @@ mod tests {
     #[test]
     fn labeling_is_idempotent_and_returns_unchanged_input_verbatim() {
         let yaml = "services:\n  app:\n    image: x\n    volumes:\n      - /cache\n";
-        let once = label(yaml, "media", Previous::New).unwrap().yaml;
-        let twice = label(&once, "media", Previous::Compose(&once)).unwrap();
+        let once = label(yaml, "media", Previous::New, "").unwrap().yaml;
+        let twice = label(&once, "media", Previous::Compose(&once), "").unwrap();
         assert_eq!(twice.yaml, once);
         assert!(twice.notes.is_empty(), "{:?}", twice.notes);
     }
 
     #[test]
     fn unparseable_compose_is_refused() {
-        assert!(label("a: : :\n - b", "media", Previous::New).is_err());
+        assert!(label("a: : :\n - b", "media", Previous::New, "").is_err());
     }
 
     #[test]
@@ -969,7 +1082,7 @@ mod tests {
     #[test]
     fn edits_keep_comments_anchors_and_quoting() {
         let yaml = "# media stack\nx-common: &common\n  restart: unless-stopped # always\n  environment:\n    COUNT: '1_000'\n    HEX: '0x_1F'\n    F: '1_0.5'\nservices:\n  app:\n    <<: *common\n    image: x # pinned\n  worker:\n    <<: *common\n    image: y\n";
-        let l = label(yaml, "media", Previous::New).unwrap();
+        let l = label(yaml, "media", Previous::New, "").unwrap();
         assert!(l.notes.is_empty(), "{:?}", l.notes);
         for kept in [
             "# media stack\n",
@@ -1089,7 +1202,7 @@ mod tests {
     fn audit_refuses_an_empty_compose() {
         assert!(audit("").is_err());
         assert!(audit("# just comments\n").is_err());
-        assert!(label("", "media", Previous::New).is_err());
+        assert!(label("", "media", Previous::New, "").is_err());
     }
 
     /// The input lines of a `diff` with no removals, i.e. the output with the
@@ -1107,7 +1220,7 @@ mod tests {
 
     #[test]
     fn operator_text_survives_byte_for_byte_outside_inserted_labels() {
-        let l = label(OPERATOR_COMPOSE, "media", Previous::New).unwrap();
+        let l = label(OPERATOR_COMPOSE, "media", Previous::New, "").unwrap();
         assert!(l.notes.is_empty(), "{:?}", l.notes);
         assert_ne!(l.yaml, OPERATOR_COMPOSE);
         assert_eq!(kept(OPERATOR_COMPOSE, &l.yaml), OPERATOR_COMPOSE);
@@ -1146,7 +1259,7 @@ mod tests {
             Previous::Compose("not: [valid"),
         ];
         for p in previous {
-            let l = label(OPERATOR_COMPOSE, "media", p).unwrap();
+            let l = label(OPERATOR_COMPOSE, "media", p, "").unwrap();
             let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
             assert!(v["networks"]["backend"].get("labels").is_none(), "{p:?}");
             assert!(v["volumes"]["data"].get("labels").is_none(), "{p:?}");
@@ -1169,15 +1282,139 @@ mod tests {
     fn rerunning_on_its_own_output_changes_nothing() {
         let anonymous = "services:\n  app:\n    image: x\n    volumes:\n      - /cache\n";
         for yaml in [OPERATOR_COMPOSE, anonymous] {
-            let once = label(yaml, "media", Previous::New).unwrap();
+            let once = label(yaml, "media", Previous::New, "").unwrap();
             assert!(once.notes.is_empty(), "{:?}", once.notes);
-            let twice = label(&once.yaml, "media", Previous::Compose(&once.yaml)).unwrap();
+            let twice = label(&once.yaml, "media", Previous::Compose(&once.yaml), "").unwrap();
             assert_eq!(twice.yaml, once.yaml);
             assert!(twice.notes.is_empty(), "{:?}", twice.notes);
-            let thrice = label(&twice.yaml, "media", Previous::Compose(&once.yaml)).unwrap();
+            let thrice = label(&twice.yaml, "media", Previous::Compose(&once.yaml), "").unwrap();
             assert_eq!(thrice.yaml, once.yaml);
             assert_eq!(diff(&once.yaml, &thrice.yaml), "");
         }
+    }
+
+    #[test]
+    fn a_failed_read_back_undoes_only_that_edit() {
+        let yaml = "# stack\nservices:\n  app:\n    image: x # pinned\n    network_mode: host\n  web:\n    image: y\n    network_mode: host\n";
+        crate::yaml_text::sabotage::arm(Some("orca.managed"));
+        let all = label(yaml, "media", Previous::New, "").unwrap();
+        crate::yaml_text::sabotage::arm(Some("orca.service: \"app\""));
+        let one = label(yaml, "media", Previous::New, "").unwrap();
+        crate::yaml_text::sabotage::arm(None);
+
+        assert_eq!(all.yaml, yaml);
+        assert_eq!(all.unlabeled, ["service 'app'", "service 'web'"]);
+        assert_eq!(
+            all.notes[0],
+            "service 'app' not labeled: the edited compose did not read back as intended"
+        );
+
+        assert_eq!(one.unlabeled, ["service 'app'"]);
+        assert_eq!(one.notes.len(), 1, "{:?}", one.notes);
+        let v: Value = serde_yaml::from_str(&one.yaml).unwrap();
+        assert!(v["services"]["app"].get("labels").is_none());
+        assert_eq!(v["services"]["web"]["labels"][SERVICE], "web");
+        assert_eq!(kept(yaml, &one.yaml), yaml);
+    }
+
+    #[test]
+    fn labels_land_after_a_block_scalar_ending_in_a_hash_line() {
+        let yaml = "services:\n  app:\n    image: x\n    network_mode: host\n    command: |\n      echo hi\n      # keep me\n  web:\n    image: y\n    network_mode: host\n";
+        let (v, notes) = labeled(yaml, Previous::New);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(v["services"]["app"]["command"], "echo hi\n# keep me\n");
+        assert_eq!(v["services"]["app"]["labels"][SERVICE], "app");
+    }
+
+    #[test]
+    fn a_tab_before_a_comment_still_reads_as_a_key() {
+        let yaml = "services:\n  app:\n    image:\tx\n    network_mode: host\n    labels:\t# c\n      team: a\n";
+        let (v, notes) = labeled(yaml, Previous::New);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(v["services"]["app"]["labels"]["team"], "a");
+        assert_eq!(v["services"]["app"]["labels"][MANAGED], "true");
+    }
+
+    #[test]
+    fn previous_compose_without_services_is_unknown() {
+        let yaml = "services:\n  app:\n    image: x\n    volumes:\n      - data:/data\nvolumes:\n  data:\n";
+        let l = label(yaml, "media", Previous::Compose("services: {}\n"), "").unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert!(v["volumes"]["data"].get("labels").is_none());
+        assert!(v.get("networks").is_none());
+        assert_eq!(l.unlabeled, ["volume 'data'", "network 'default'"]);
+        assert!(l.assumed_new.is_empty());
+    }
+
+    #[test]
+    fn only_this_stacks_labels_exempt_an_explicitly_named_volume() {
+        for (labels, ours) in [
+            (
+                "orca.managed: 'true'\n      orca.owner: dockge\n      orca.stack: media",
+                true,
+            ),
+            (
+                "orca.managed: 'true'\n      orca.owner: dockge\n      orca.stack: other",
+                false,
+            ),
+            (
+                "orca.managed: 'true'\n      orca.owner: docker\n      orca.stack: media",
+                false,
+            ),
+        ] {
+            let yaml = format!(
+                "services:\n  app:\n    image: x\n    network_mode: host\n    volumes:\n      - data:/data\nvolumes:\n  data:\n    name: shared\n    labels:\n      {labels}\n"
+            );
+            let l = label(&yaml, "media", Previous::New, "").unwrap();
+            assert_eq!(l.unlabeled.is_empty(), ours, "{labels}: {:?}", l.notes);
+        }
+    }
+
+    #[test]
+    fn compose_project_name_in_env_overrides_the_name_key() {
+        assert_eq!(
+            env_project("A=1\nexport COMPOSE_PROJECT_NAME='tv' # x\n").as_deref(),
+            Some("tv")
+        );
+        assert_eq!(
+            env_project("COMPOSE_PROJECT_NAME=\"a b\"").as_deref(),
+            Some("a b")
+        );
+        assert_eq!(
+            env_project("COMPOSE_PROJECT_NAME=tv # c").as_deref(),
+            Some("tv")
+        );
+        assert_eq!(
+            env_project("# COMPOSE_PROJECT_NAME=tv\nCOMPOSE_PROJECT_NAME="),
+            None
+        );
+        let yaml = "name: other\nservices:\n  app:\n    image: x\n    network_mode: host\n";
+        let l = label(yaml, "media", Previous::New, "COMPOSE_PROJECT_NAME=tv\n").unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(v["services"]["app"]["labels"][STACK], "tv");
+        assert_eq!(v["services"]["app"]["labels"][UNIT], "media");
+    }
+
+    #[test]
+    fn unlabeled_and_assumed_new_are_reported_structurally() {
+        let yaml = "services:\n  app:\n    image: x\n    volumes:\n      - data:/data\n      - /cache\nnetworks:\n  backend:\nvolumes:\n  data:\n";
+        let new = label(yaml, "media", Previous::New, "").unwrap();
+        assert!(new.unlabeled.is_empty(), "{:?}", new.notes);
+        assert_eq!(
+            new.assumed_new,
+            [
+                "volume 'app_cache'",
+                "volume 'data'",
+                "network 'backend'",
+                "network 'default'"
+            ]
+        );
+        let crlf = label(&yaml.replace('\n', "\r\n"), "media", Previous::New, "").unwrap();
+        assert_eq!(
+            crlf.unlabeled,
+            ["service 'app'", "volume 'data'", "network 'backend'"]
+        );
+        assert!(crlf.assumed_new.is_empty());
     }
 
     #[test]
