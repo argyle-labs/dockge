@@ -368,7 +368,7 @@ impl Before {
             Ok(p) if p == project => Before::Compose(doc),
             Ok(p) => {
                 notes.push(format!(
-                    "the compose project changes from '{p}' to '{project}'; compose creates every volume and network anew"
+                    "the compose project changes from '{p}' to '{project}'; compose creates every volume and network anew, and the old project's containers keep running and can clash with the new ones on ports or container_name"
                 ));
                 Before::New
             }
@@ -1657,7 +1657,9 @@ mod tests {
         assert!(
             l.notes
                 .iter()
-                .any(|n| n.contains("changes from 'media' to 'tv'")),
+                .any(|n| n.contains("changes from 'media' to 'tv'")
+                    && n.contains("keep running")
+                    && n.contains("container_name")),
             "{:?}",
             l.notes
         );

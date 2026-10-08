@@ -33,7 +33,8 @@ async fn lists_stacks_against_live_dockge() {
     let insecure = env("DOCKGE_TEST_INSECURE").is_some();
 
     let client = Client::new(Config::new(url, user, pass).insecure(insecure));
-    let stacks = client
+    let session = client.connect().await.expect("log in to live dockge");
+    let stacks = session
         .list_stacks()
         .await
         .expect("list_stacks against live dockge");
@@ -48,7 +49,7 @@ async fn lists_stacks_against_live_dockge() {
         eprintln!("  - {name}: {meta}");
     }
 
-    let global = client
+    let global = session
         .global_env()
         .await
         .expect("global_env against live dockge");
@@ -62,10 +63,10 @@ async fn lists_stacks_against_live_dockge() {
         let compose = "services:\n  probe:\n    image: alpine\n    command: [\"sleep\", \"600\"]\n";
 
         // Idempotent: clear any leftover from a prior run before deploying.
-        client.stack_action(name, "down").await.ok();
-        client.delete_stack(name).await.ok();
+        session.stack_action(name, "down").await.ok();
+        session.delete_stack(name).await.ok();
 
-        let deployed = client
+        let deployed = session
             .deploy_stack(name, compose, "", true)
             .await
             .expect("deploy_stack");
@@ -76,7 +77,7 @@ async fn lists_stacks_against_live_dockge() {
             "deploy should succeed: {deployed}"
         );
 
-        let after = client.list_stacks().await.expect("relist");
+        let after = session.list_stacks().await.expect("relist");
         assert!(
             after.as_object().is_some_and(|o| o.contains_key(name)),
             "deployed stack should appear in list: {after}"
@@ -86,7 +87,10 @@ async fn lists_stacks_against_live_dockge() {
             after.get(name).map(|v| v.to_string()).unwrap_or_default()
         );
 
-        let managed = client.stack_action(name, "restart").await.expect("restart");
+        let managed = session
+            .stack_action(name, "restart")
+            .await
+            .expect("restart");
         eprintln!("MANAGE restart {name} -> {managed}");
         assert_eq!(
             managed.get("ok").and_then(|v| v.as_bool()),
@@ -94,8 +98,9 @@ async fn lists_stacks_against_live_dockge() {
             "restart should succeed: {managed}"
         );
 
-        client.stack_action(name, "down").await.ok();
-        let deleted = client.delete_stack(name).await.expect("delete");
+        session.stack_action(name, "down").await.ok();
+        let deleted = session.delete_stack(name).await.expect("delete");
         eprintln!("CLEANUP delete {name} -> {deleted}");
     }
+    session.close().await;
 }
