@@ -270,8 +270,7 @@ impl DockgeUnitProvider {
             global,
             stack: &p.compose_env,
         };
-        // The docker plugin's view of the dockge host's engine is the missing
-        // input; until it is queried, new names are assumed absent.
+        // Engine query needs docker-plugin tool.call (orca#794).
         let mut labeled =
             crate::ownership::label(&compose_yaml, &p.name, previous, env, &Engine::Unqueried)?;
         notes.append(&mut labeled.notes);

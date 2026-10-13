@@ -93,23 +93,47 @@ enum Fresh {
     Ours(BTreeMap<String, String>),
 }
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Volume,
+    Network,
+}
+
 impl Engine {
-    fn check(&self, section: &str, name: &str, resource: &str) -> Result<Fresh> {
+    /// The error is the refusal message for a name held by someone else.
+    fn check(
+        &self,
+        kind: Kind,
+        name: &str,
+        project: &str,
+        resource: &str,
+    ) -> Result<Fresh, String> {
         let Engine::Known { volumes, networks } = self else {
             return Ok(Fresh::Assumed);
         };
-        let known = if section == "volumes" {
-            volumes
-        } else {
-            networks
+        let known = match kind {
+            Kind::Volume => volumes,
+            Kind::Network => networks,
         };
-        match known.get(name) {
-            None | Some(Existing::Absent) => Ok(Fresh::Absent),
-            Some(Existing::Ours(have)) => Ok(Fresh::Ours(have.clone())),
-            Some(Existing::Foreign(have)) => bail!(
+        let have = match known.get(name) {
+            None | Some(Existing::Absent) => return Ok(Fresh::Absent),
+            Some(Existing::Ours(have) | Existing::Foreign(have)) => have,
+        };
+        let ours = labels::is_managed(have.iter())
+            && have.get(OWNER).map(String::as_str) == Some(OWNER_DOCKGE)
+            && have.get(STACK).map(String::as_str) == Some(project);
+        if !ours || matches!(known.get(name), Some(Existing::Foreign(_))) {
+            return Err(format!(
                 "{resource} already exists in the engine as '{name}' with labels {have:?}; refusing to relabel it"
-            ),
+            ));
         }
+        // Compose rejects its own com.docker.compose.* keys in a compose file.
+        Ok(Fresh::Ours(
+            have.iter()
+                .filter(|(k, _)| k.starts_with("orca."))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ))
     }
 }
 
@@ -821,7 +845,16 @@ pub fn label(
             );
             continue;
         }
-        let fresh = engine.check("volumes", &name, &what)?;
+        let fresh = match engine.check(Kind::Volume, &name, &project, &what) {
+            Ok(f) => f,
+            Err(_) => {
+                e.skip(
+                    &what,
+                    &format!("not converted: volume '{name}' already exists in the engine and is not this stack's"),
+                );
+                continue;
+            }
+        };
         let mut body = Mapping::new();
         body.insert(Value::from("name"), Value::from(name.as_str()));
         body.extend(labels_body(&match &fresh {
@@ -864,7 +897,15 @@ pub fn label(
         };
         match before.prior("volumes", key) {
             Prior::Absent => {
-                match engine.check("volumes", &format!("{project}_{key}"), &resource)? {
+                match engine
+                    .check(
+                        Kind::Volume,
+                        &format!("{project}_{key}"),
+                        &project,
+                        &resource,
+                    )
+                    .map_err(|m| anyhow!(m))?
+                {
                     Fresh::Ours(have) => e.label("volumes", key, &have, &resource),
                     fresh => {
                         e.label("volumes", key, &wanted.to_map(), &resource);
@@ -910,7 +951,10 @@ pub fn label(
             continue;
         }
         let labels = match before.prior("networks", &key) {
-            Prior::Absent => match engine.check("networks", &format!("{project}_{key}"), &what)? {
+            Prior::Absent => match engine
+                .check(Kind::Network, &format!("{project}_{key}"), &project, &what)
+                .map_err(|m| anyhow!(m))?
+            {
                 Fresh::Ours(have) => have,
                 fresh => {
                     if matches!(fresh, Fresh::Assumed) {
@@ -1781,13 +1825,29 @@ mod tests {
     }
 
     fn with_engine(volumes: Vec<(&str, Existing)>) -> Engine {
+        engine_of(volumes, vec![])
+    }
+
+    fn engine_of(volumes: Vec<(&str, Existing)>, networks: Vec<(&str, Existing)>) -> Engine {
+        let map =
+            |v: Vec<(&str, Existing)>| v.into_iter().map(|(k, e)| (k.to_string(), e)).collect();
         Engine::Known {
-            volumes: volumes
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            networks: BTreeMap::new(),
+            volumes: map(volumes),
+            networks: map(networks),
         }
+    }
+
+    fn ours(stack: &str) -> BTreeMap<String, String> {
+        [
+            (MANAGED.to_string(), "true".to_string()),
+            (OWNER.to_string(), OWNER_DOCKGE.to_string()),
+            (STACK.to_string(), stack.to_string()),
+        ]
+        .into()
+    }
+
+    fn foreign() -> Existing {
+        Existing::Foreign([("com.example.app".to_string(), "other".to_string())].into())
     }
 
     const ENGINE_COMPOSE: &str =
@@ -1835,5 +1895,104 @@ mod tests {
             .to_string();
         assert!(err.contains("media_data"), "{err}");
         assert!(err.contains("com.example.app"), "{err}");
+    }
+
+    #[test]
+    fn a_foreign_default_network_is_refused() {
+        let yaml = "services:\n  app:\n    image: x\n";
+        let engine = engine_of(vec![], vec![("media_default", foreign())]);
+        let err = super::label(yaml, "media", Previous::New, env(""), &engine)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("media_default"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_network_already_ours_keeps_its_engine_labels() {
+        let yaml = "services:\n  app:\n    image: x\n    networks: [back]\nnetworks:\n  back:\n";
+        let engine = engine_of(vec![], vec![("media_back", Existing::Ours(ours("media")))]);
+        let l = super::label(yaml, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(
+            label_map(v["networks"]["back"].get("labels")),
+            ours("media")
+        );
+    }
+
+    const ANONYMOUS: &str =
+        "services:\n  app:\n    image: x\n    network_mode: none\n    volumes:\n      - /cache\n";
+
+    #[test]
+    fn an_anonymous_volume_converts_onto_one_already_ours() {
+        let engine = with_engine(vec![("media_app_cache", Existing::Ours(ours("media")))]);
+        let l = super::label(ANONYMOUS, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(v["services"]["app"]["volumes"][0], "app_cache:/cache");
+        assert_eq!(
+            label_map(v["volumes"]["app_cache"].get("labels")),
+            ours("media")
+        );
+    }
+
+    #[test]
+    fn an_anonymous_volume_whose_name_is_foreign_is_left_anonymous() {
+        let engine = with_engine(vec![("media_app_cache", foreign())]);
+        let l = super::label(ANONYMOUS, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(v["services"]["app"]["volumes"][0], "/cache");
+        assert!(v.get("volumes").is_none());
+        assert_eq!(l.unlabeled, ["service 'app' anonymous volume at /cache"]);
+    }
+
+    #[test]
+    fn external_and_named_entries_ignore_a_foreign_engine() {
+        let yaml = "services:\n  app:\n    image: x\n    volumes:\n      - ext:/a\n      - named:/b\n    networks: [outside, shared]\nvolumes:\n  ext:\n    external: true\n  named:\n    name: shared_data\nnetworks:\n  outside:\n    external: true\n  shared:\n    name: shared_net\n";
+        let engine = engine_of(
+            vec![
+                ("media_ext", foreign()),
+                ("ext", foreign()),
+                ("media_named", foreign()),
+                ("shared_data", foreign()),
+            ],
+            vec![
+                ("media_outside", foreign()),
+                ("outside", foreign()),
+                ("media_shared", foreign()),
+                ("shared_net", foreign()),
+            ],
+        );
+        let l = super::label(yaml, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        for (section, key) in [
+            ("volumes", "ext"),
+            ("volumes", "named"),
+            ("networks", "outside"),
+            ("networks", "shared"),
+        ] {
+            assert!(v[section][key].get("labels").is_none(), "{section}.{key}");
+        }
+    }
+
+    #[test]
+    fn engine_labels_for_another_stack_are_foreign() {
+        let engine = with_engine(vec![("media_data", Existing::Ours(ours("other")))]);
+        let err = super::label(ENGINE_COMPOSE, "media", Previous::New, env(""), &engine)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("media_data"), "{err}");
+    }
+
+    #[test]
+    fn compose_labels_are_dropped_from_engine_labels() {
+        let mut have = ours("media");
+        have.insert(
+            "com.docker.compose.project".to_string(),
+            "media".to_string(),
+        );
+        have.insert("com.example.app".to_string(), "x".to_string());
+        let engine = with_engine(vec![("media_data", Existing::Ours(have))]);
+        let l = super::label(ENGINE_COMPOSE, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(label_map(v["volumes"]["data"].get("labels")), ours("media"));
     }
 }
