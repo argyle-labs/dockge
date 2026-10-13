@@ -64,6 +64,55 @@ pub enum Previous<'a> {
     Compose { yaml: &'a str, env: &'a str },
 }
 
+/// A volume or network as the engine reports it, by engine name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Existing {
+    Absent,
+    /// Carries this stack's orca labels, which are kept as they are.
+    Ours(BTreeMap<String, String>),
+    /// Exists with someone else's labels; never relabeled.
+    Foreign(BTreeMap<String, String>),
+}
+
+/// What the engine holds under the names this deploy would label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Engine {
+    /// No engine query was made; names new to the stack are assumed absent.
+    Unqueried,
+    /// Names missing from a map are absent.
+    Known {
+        volumes: BTreeMap<String, Existing>,
+        networks: BTreeMap<String, Existing>,
+    },
+}
+
+/// How a volume or network new to the stack gets its labels.
+enum Fresh {
+    Assumed,
+    Absent,
+    Ours(BTreeMap<String, String>),
+}
+
+impl Engine {
+    fn check(&self, section: &str, name: &str, resource: &str) -> Result<Fresh> {
+        let Engine::Known { volumes, networks } = self else {
+            return Ok(Fresh::Assumed);
+        };
+        let known = if section == "volumes" {
+            volumes
+        } else {
+            networks
+        };
+        match known.get(name) {
+            None | Some(Existing::Absent) => Ok(Fresh::Absent),
+            Some(Existing::Ours(have)) => Ok(Fresh::Ours(have.clone())),
+            Some(Existing::Foreign(have)) => bail!(
+                "{resource} already exists in the engine as '{name}' with labels {have:?}; refusing to relabel it"
+            ),
+        }
+    }
+}
+
 /// The env files dockge hands compose, `--env-file ../global.env --env-file
 /// ./.env`; the later file wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +712,7 @@ pub fn label(
     stack: &str,
     previous: Previous<'_>,
     env: EnvFiles<'_>,
+    engine: &Engine,
 ) -> Result<Labeled> {
     let original = parse(compose_yaml)?;
     if !original.is_mapping() {
@@ -771,18 +821,22 @@ pub fn label(
             );
             continue;
         }
+        let fresh = engine.check("volumes", &name, &what)?;
         let mut body = Mapping::new();
         body.insert(Value::from("name"), Value::from(name.as_str()));
-        body.extend(labels_body(
-            &Labels::for_(OWNER_DOCKGE, &project, Some(&svc), Some(stack))
+        body.extend(labels_body(&match &fresh {
+            Fresh::Ours(have) => have.clone(),
+            _ => Labels::for_(OWNER_DOCKGE, &project, Some(&svc), Some(stack))
                 .with_mount(&target)
                 .to_map(),
-        ));
+        }));
         if e.try_edit(&what, "not converted", |e| {
             e.add("volumes", &volume, body)?;
             e.convert(&svc, i, &volume, &target)
         }) {
-            assumed_new.push(format!("volume '{volume}'"));
+            if matches!(fresh, Fresh::Assumed) {
+                assumed_new.push(format!("volume '{volume}'"));
+            }
             taken.insert(volume);
             engine_names.insert(name);
         }
@@ -810,8 +864,15 @@ pub fn label(
         };
         match before.prior("volumes", key) {
             Prior::Absent => {
-                e.label("volumes", key, &wanted.to_map(), &resource);
-                assumed_new.push(resource);
+                match engine.check("volumes", &format!("{project}_{key}"), &resource)? {
+                    Fresh::Ours(have) => e.label("volumes", key, &have, &resource),
+                    fresh => {
+                        e.label("volumes", key, &wanted.to_map(), &resource);
+                        if matches!(fresh, Fresh::Assumed) {
+                            assumed_new.push(resource);
+                        }
+                    }
+                }
             }
             Prior::Managed(have) => e.label("volumes", key, &have, &resource),
             Prior::Unlabeled => e.skip(
@@ -849,10 +910,15 @@ pub fn label(
             continue;
         }
         let labels = match before.prior("networks", &key) {
-            Prior::Absent => {
-                assumed_new.push(what.clone());
-                Labels::for_(OWNER_DOCKGE, &project, None, Some(stack)).to_map()
-            }
+            Prior::Absent => match engine.check("networks", &format!("{project}_{key}"), &what)? {
+                Fresh::Ours(have) => have,
+                fresh => {
+                    if matches!(fresh, Fresh::Assumed) {
+                        assumed_new.push(what.clone());
+                    }
+                    Labels::for_(OWNER_DOCKGE, &project, None, Some(stack)).to_map()
+                }
+            },
             Prior::Managed(have) => have,
             Prior::Unlabeled => {
                 e.skip(
@@ -1000,6 +1066,15 @@ mod tests {
             global: Ok(""),
             stack,
         }
+    }
+
+    fn label(
+        yaml: &str,
+        stack: &str,
+        previous: Previous<'_>,
+        env: EnvFiles<'_>,
+    ) -> Result<Labeled> {
+        super::label(yaml, stack, previous, env, &Engine::Unqueried)
     }
 
     fn labeled(yaml: &str, previous: Previous<'_>) -> (Value, Vec<String>) {
@@ -1703,5 +1778,62 @@ mod tests {
     fn diff_marks_added_and_removed_lines() {
         assert_eq!(diff("a\nb\n", "a\nb\n"), "");
         assert_eq!(diff("a\nb\nc\n", "a\nx\nc\n"), " a\n-b\n+x\n c\n");
+    }
+
+    fn with_engine(volumes: Vec<(&str, Existing)>) -> Engine {
+        Engine::Known {
+            volumes: volumes
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            networks: BTreeMap::new(),
+        }
+    }
+
+    const ENGINE_COMPOSE: &str =
+        "services:\n  app:\n    image: x\n    volumes:\n      - data:/data\nvolumes:\n  data:\n";
+
+    #[test]
+    fn an_unqueried_engine_labels_new_volumes_as_assumed_new() {
+        let l = label(ENGINE_COMPOSE, "media", Previous::New, env("")).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(v["volumes"]["data"]["labels"][OWNER], OWNER_DOCKGE);
+        assert!(l.assumed_new.contains(&"volume 'data'".to_string()));
+    }
+
+    #[test]
+    fn a_volume_absent_from_the_engine_is_labeled_and_not_assumed() {
+        let engine = with_engine(vec![("media_data", Existing::Absent)]);
+        let l = super::label(ENGINE_COMPOSE, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(v["volumes"]["data"]["labels"][OWNER], OWNER_DOCKGE);
+        assert!(l.assumed_new.is_empty());
+    }
+
+    #[test]
+    fn a_volume_already_ours_keeps_its_engine_labels() {
+        let have: BTreeMap<String, String> = [
+            (MANAGED.to_string(), "true".to_string()),
+            (OWNER.to_string(), OWNER_DOCKGE.to_string()),
+            (STACK.to_string(), "media".to_string()),
+        ]
+        .into();
+        let engine = with_engine(vec![("media_data", Existing::Ours(have.clone()))]);
+        let l = super::label(ENGINE_COMPOSE, "media", Previous::New, env(""), &engine).unwrap();
+        let v: Value = serde_yaml::from_str(&l.yaml).unwrap();
+        assert_eq!(label_map(v["volumes"]["data"].get("labels")), have);
+        assert!(l.assumed_new.is_empty());
+    }
+
+    #[test]
+    fn a_foreign_volume_is_refused_naming_it_and_its_labels() {
+        let have: BTreeMap<String, String> =
+            [("com.example.app".to_string(), "other".to_string())].into();
+        let engine = with_engine(vec![("media_data", Existing::Foreign(have))]);
+        let err = super::label(ENGINE_COMPOSE, "media", Previous::New, env(""), &engine)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("media_data"), "{err}");
+        assert!(err.contains("com.example.app"), "{err}");
     }
 }

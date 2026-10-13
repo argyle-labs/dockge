@@ -31,7 +31,7 @@ use plugin_toolkit::serde::{Deserialize, Serialize};
 use plugin_toolkit::serde_json::{self, Value, json};
 
 use crate::Session;
-use crate::ownership::{EnvFiles, Labeled, Previous};
+use crate::ownership::{Engine, EnvFiles, Labeled, Previous};
 use crate::tools::{enabled_endpoints, make_client};
 
 const KIND: &str = "stack";
@@ -270,7 +270,10 @@ impl DockgeUnitProvider {
             global,
             stack: &p.compose_env,
         };
-        let mut labeled = crate::ownership::label(&compose_yaml, &p.name, previous, env)?;
+        // The docker plugin's view of the dockge host's engine is the missing
+        // input; until it is queried, new names are assumed absent.
+        let mut labeled =
+            crate::ownership::label(&compose_yaml, &p.name, previous, env, &Engine::Unqueried)?;
         notes.append(&mut labeled.notes);
         labeled.notes = notes;
         Ok(labeled)
