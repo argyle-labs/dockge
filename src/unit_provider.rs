@@ -33,8 +33,23 @@ use plugin_toolkit::serde_json::{self, Value, json};
 use crate::Session;
 use crate::ownership::{EnvFiles, Labeled, Previous};
 use crate::tools::{enabled_endpoints, make_client};
+use plugin_toolkit::contract::CallerIdentity;
 
 const KIND: &str = "stack";
+
+fn require_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    match caller {
+        Some(c) if c.role == "admin" => Ok(()),
+        Some(c) => Err(anyhow::anyhow!(
+            "{subject} requires role 'admin'; caller '{}' has '{}'",
+            c.username,
+            c.role
+        )),
+        None => Err(anyhow::anyhow!(
+            "{subject} refused: the call carries no caller identity, so admin cannot be verified"
+        )),
+    }
+}
 
 /// Typed payload for `Create { action: "deploy" }` and `Upsert { action: "set" }`
 /// — everything dockge's `deployStack` (`docker compose up -d`) needs. `create`
@@ -220,6 +235,7 @@ impl DockgeUnitProvider {
     }
 
     async fn do_update(&self, args: UpdateArgs) -> Result<VerbOutcome> {
+        require_admin("stack update", args.caller.as_ref())?;
         let ep = Self::endpoint_of(&args.id.manager).to_string();
         let op = args.action.as_str();
         if !ACTIONS.contains(&op) {
@@ -236,6 +252,7 @@ impl DockgeUnitProvider {
     }
 
     async fn do_delete(&self, args: DeleteArgs) -> Result<VerbOutcome> {
+        require_admin("stack delete", args.caller.as_ref())?;
         let ep = Self::endpoint_of(&args.id.manager).to_string();
         let session = make_client(&ep)?.connect().await?;
         let deleted = session.delete_stack(&args.id.id).await;
@@ -338,6 +355,7 @@ impl DockgeUnitProvider {
     }
 
     async fn do_create(&self, args: CreateArgs) -> Result<VerbOutcome> {
+        require_admin("stack create", args.caller.as_ref())?;
         if args.action != "deploy" {
             return Err(anyhow::anyhow!(
                 "unknown stack create action: {}",
@@ -355,6 +373,7 @@ impl DockgeUnitProvider {
     /// Idempotent create-or-update: add the stack if absent on the endpoint,
     /// otherwise redeploy over the existing one.
     async fn do_upsert(&self, args: UpsertArgs) -> Result<VerbOutcome> {
+        require_admin("stack upsert", args.caller.as_ref())?;
         let p = Self::parse_deploy_payload(args.payload)?;
         let session = make_client(&p.endpoint)?.connect().await?;
         let out = Self::upsert(&session, p).await;
@@ -473,6 +492,90 @@ impl UnitProvider for DockgeUnitProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caller(role: &str) -> CallerIdentity {
+        CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: role.into(),
+            can_mutate: true,
+        }
+    }
+
+    fn refused(r: Result<VerbOutcome>) -> bool {
+        r.err().is_some_and(|e| {
+            let m = e.to_string();
+            m.contains("requires role 'admin'") || m.contains("no caller identity")
+        })
+    }
+
+    async fn run_every_mutating_verb(who: Option<CallerIdentity>) -> Vec<(&'static str, bool)> {
+        let p = DockgeUnitProvider::new();
+        let id = DockgeUnitProvider::unit_id("no-such-endpoint", "media");
+        vec![
+            (
+                "create",
+                refused(
+                    p.do_create(CreateArgs {
+                        action: "bogus".into(),
+                        payload: None,
+                        caller: who.clone(),
+                    })
+                    .await,
+                ),
+            ),
+            (
+                "update",
+                refused(
+                    p.do_update(UpdateArgs {
+                        id: id.clone(),
+                        action: "bogus".into(),
+                        payload: None,
+                        caller: who.clone(),
+                    })
+                    .await,
+                ),
+            ),
+            (
+                "delete",
+                refused(
+                    p.do_delete(DeleteArgs {
+                        id: id.clone(),
+                        caller: who.clone(),
+                    })
+                    .await,
+                ),
+            ),
+            (
+                "upsert",
+                refused(
+                    p.do_upsert(UpsertArgs {
+                        id,
+                        action: "set".into(),
+                        payload: None,
+                        caller: who,
+                    })
+                    .await,
+                ),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn admin_passes_the_gate_on_every_mutating_verb() {
+        for (verb, was_refused) in run_every_mutating_verb(Some(caller("admin"))).await {
+            assert!(!was_refused, "{verb} refused an admin");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_or_missing_caller_is_refused_on_every_mutating_verb() {
+        for who in [None, Some(caller("member")), Some(caller("user"))] {
+            for (verb, was_refused) in run_every_mutating_verb(who.clone()).await {
+                assert!(was_refused, "{verb} let {who:?} through");
+            }
+        }
+    }
 
     #[test]
     fn manager_round_trips_endpoint() {
