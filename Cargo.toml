@@ -31,12 +31,7 @@ path = "src/main.rs"
 # `plugin_toolkit::*` / its prelude, or injected by the
 # `#[orca_tool]`/`endpoint_resource!` macro expansions (which emit
 # `::plugin_toolkit::*` paths). The plugin source names no external crate.
-#
-# Pinned to the orca rc tag that carries the plugin-toolkit surface (the
-# `plugin_toolkit::urlencoding` re-export + endpoint_resource! macro). Until a
-# checkout of orca exists at ../orca, the committed `[patch]` in
-# `.cargo/config.toml` resolves this to the local in-tree toolkit.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "socketio", "containers"] }
+plugin-toolkit = { version = ">=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "socketio", "containers"] }
 # Order-preserving compose-YAML rewrite for bind-mount propagation (orca #402
 # Part B). Reuses the serde the toolkit already re-exports — no second copy.
 serde_yaml = "0.9"
@@ -44,7 +39,7 @@ serde_yaml = "0.9"
 [dev-dependencies]
 # Dev-only: the in-crate tests reach serde_json + tokio. The env-gated
 # integration test (`DOCKGE_TEST_URL`) drives a live dockge over Socket.IO.
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "socketio", "containers"] }
+plugin-toolkit = { version = ">=0.2.1-rc.47", registry = "gitea", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db", "socketio", "containers"] }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # Match orca's workspace lint floor: discarding a Result/Option via
