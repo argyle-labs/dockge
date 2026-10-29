@@ -19,6 +19,7 @@
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::secrets;
 
 use crate::{Client, Config};
 
@@ -42,10 +43,17 @@ pub struct DockgeEndpoint {
 /// to drive that instance's stacks over Socket.IO.
 pub(crate) fn make_client(name: &str) -> Result<Client> {
     let row = endpoint_db::require(name)?;
+    // `endpoint_db::require` never populates `#[secret]` fields (so
+    // list/detail can't leak the password) — read the real value from the
+    // secrets store under the same `scoped_name` key create/update wrote it to.
+    let key = secrets::scoped_name("dockge", name, "password")?;
+    let password = secrets::get(key.as_str())?
+        .map(|s| s.expose_secret().clone())
+        .with_context(|| format!("dockge endpoint '{name}' has no stored password"))?;
     Ok(Client::new(Config::new(
         row.base_url,
         row.username,
-        row.password,
+        password,
     )))
 }
 
