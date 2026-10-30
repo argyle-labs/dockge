@@ -13,11 +13,11 @@
 //! *instances*). No bespoke **stack** verbs — stacks ride the generic unit
 //! surface.
 //!
-//! Deploy/backup/restore of the dockge web app *itself* lives in `scripts/`
-//! (standalone) and returns as a proper `service` domain backend in a
-//! follow-up — it is deliberately NOT a set of bespoke `dockge.*` tool verbs
-//! (the old `lifecycle` module both collided with the endpoint registry's
-//! `dockge.update` and violated the five-verb surface).
+//! Deploy/backup/restore of the dockge web app *itself* rides a
+//! [`DockgeBackend`] implementing `ServiceBackend` — deliberately NOT a set
+//! of bespoke `dockge.*` tool verbs (the old `lifecycle` module both
+//! collided with the endpoint registry's `dockge.update` and violated the
+//! five-verb surface).
 // Socket.IO frames are dynamic JSON; Value lives only at this transport edge.
 #![allow(clippy::disallowed_types)]
 
@@ -34,7 +34,81 @@ use std::time::Duration;
 
 use plugin_toolkit::anyhow::{Context, Result, bail};
 use plugin_toolkit::serde_json::{Value, json};
+use plugin_toolkit::service::{
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
+    WorkloadSpec,
+};
 use plugin_toolkit::socketio::{PushHandler, SocketConfig, SocketSession};
+
+/// Dockge's own app backend — deploy/backup/restore of the dockge web app
+/// itself. Distinct from [`unit_provider::DockgeUnitProvider`], which drives
+/// the stacks *dockge manages*, not dockge's own state.
+#[derive(Debug, Clone)]
+pub struct DockgeBackend {
+    provider: &'static str,
+}
+
+impl DockgeBackend {
+    pub fn new(provider: &'static str) -> Self {
+        Self { provider }
+    }
+}
+
+impl ServiceBackend for DockgeBackend {
+    fn provider(&self) -> &str {
+        self.provider
+    }
+
+    fn runtimes(&self) -> Vec<Runtime> {
+        vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc, Runtime::Vm]
+    }
+
+    fn capabilities(&self) -> Vec<ServiceCapability> {
+        vec![
+            ServiceCapability::Deploy,
+            ServiceCapability::Backup,
+            ServiceCapability::Restore,
+            ServiceCapability::Configure,
+            ServiceCapability::Status,
+        ]
+    }
+
+    fn default_port(&self) -> u16 {
+        5001
+    }
+
+    /// `/opt/stacks` and the docker socket are operational mounts dockge
+    /// needs to manage other stacks, not dockge's own backup state.
+    fn data_paths(&self) -> Vec<String> {
+        vec!["/app/data".to_string()]
+    }
+
+    fn workload_spec<'a>(
+        &'a self,
+        _runtime: Runtime,
+        _instance: &'a str,
+        _routes: &'a Routes,
+    ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
+        Box::pin(async move { Err(ServiceError::unimplemented("dockge.workload_spec")) })
+    }
+
+    fn configure<'a>(
+        &'a self,
+        _instance: &'a str,
+        _routes: &'a Routes,
+        _config: &'a str,
+    ) -> BoxFuture<'a, Result<(), ServiceError>> {
+        Box::pin(async move { Err(ServiceError::unimplemented("dockge.configure")) })
+    }
+
+    fn status<'a>(
+        &'a self,
+        _instance: &'a str,
+        _routes: &'a Routes,
+    ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
+        Box::pin(async move { Err(ServiceError::unimplemented("dockge.status")) })
+    }
+}
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(8);
 /// Dockge builds the stack list with `docker compose ls`, slow on a busy
@@ -362,6 +436,13 @@ async fn wait_for_slot(slot: &Arc<Mutex<Option<Value>>>, limit: Duration) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_backend_declares_app_data_only() {
+        let b = DockgeBackend::new("dockge");
+        assert_eq!(b.provider(), "dockge");
+        assert_eq!(b.data_paths(), vec!["/app/data".to_string()]);
+    }
 
     #[test]
     fn ack_ok_reads_bool() {
