@@ -43,9 +43,6 @@ pub struct DockgeEndpoint {
 /// to drive that instance's stacks over Socket.IO.
 pub(crate) fn make_client(name: &str) -> Result<Client> {
     let row = endpoint_db::require(name)?;
-    // `endpoint_db::require` never populates `#[secret]` fields (so
-    // list/detail can't leak the password) — read the real value from the
-    // secrets store under the same `scoped_name` key create/update wrote it to.
     let password = secrets::resolve_scoped("dockge", name, "password")?
         .expose_secret()
         .clone();
